@@ -1,2 +1,58 @@
 # ghidra-headless-mcp
-A simple, minimal, Ghidra MCP headless sever
+
+Minimal headless [MCP](https://modelcontextprotocol.io) server for Ghidra. No GUI, no plugin, no HTTP bridge:
+it runs Ghidra in-process through [PyGhidra](https://pypi.org/project/pyghidra/). Sibling of
+[Revoid](https://github.com/samudoria/revoid) (jadx) and uses the same tool style.
+
+## Install
+
+Requires Python 3.9+, JDK 21+ and [Ghidra](https://ghidra-sre.org) 11.3+ (tested on 12.1).
+
+```bash
+pip install git+https://github.com/samudoria/ghidra-headless-mcp
+```
+
+```json
+{
+  "mcpServers": {
+    "ghidra": {
+      "command": "ghidra-headless-mcp",
+      "env": { "GHIDRA_INSTALL_DIR": "/opt/ghidra" }
+    }
+  }
+}
+```
+
+## Tools
+
+| Tool | Description |
+|------|-------------|
+| `load_binary` | Import + auto-analyze a binary (ELF/.so, PE, Mach-O...). **Call first.** Cached per file. |
+| `list_functions` | Functions (name, address, signature); `filter` = regex. Paginated. |
+| `get_function` | Decompiled C (`function` = name or any address inside). |
+| `get_disassembly` | Assembly listing of a function. |
+| `list_strings` / `list_imports` / `list_exports` | Paginated, `filter` = regex. |
+| `get_callers` / `get_callees` | Call graph neighbours of a function. |
+| `get_xrefs` | References to an address, function or string. |
+| `rename` | Rename a function or label. |
+| `rename_variable` | Rename a local/parameter seen in the decompiled C. |
+| `add_comment` | `pre` (default), `eol`, `post`, `plate`, `repeatable`. Empty text clears. |
+
+All lists take `limit` (default 50) and `offset`; the reply contains `next_offset` (null at the end).
+Edits are saved to the Ghidra project immediately and survive restarts: reloading the same file reopens your names and comments.
+
+## Environment
+
+| Variable | Purpose |
+|----------|---------|
+| `GHIDRA_INSTALL_DIR` (or `GHIDRA_HOME`) | Ghidra install directory (required) |
+| `GHIDRA_MCP_HOME` | Where projects are stored (default `~/.ghidra_mcp`) |
+
+One binary is loaded at a time; `load_binary` closes the previous one. Only one server may open a given project at a time.
+Logs go to stderr; stdout is reserved for the protocol.
+
+## Test
+
+```bash
+GHIDRA_INSTALL_DIR=/opt/ghidra python tests/smoke.py ./some_binary some_function
+```

@@ -9,7 +9,7 @@ it runs Ghidra in-process through [PyGhidra](https://pypi.org/project/pyghidra/)
 Requires Python 3.9+, JDK 21+ and [Ghidra](https://ghidra-sre.org) 11.3+ (tested on 12.1).
 
 ```bash
-pip install git+https://github.com/samudoria/ghidra-headless-mcp
+pip install git+https://github.com/samudoria/ghidra-headless-mcp   # or the wheel from Releases
 ```
 
 ```json
@@ -22,6 +22,12 @@ pip install git+https://github.com/samudoria/ghidra-headless-mcp
   }
 }
 ```
+
+## Use with Revoid
+
+For Android apps: in [Revoid](https://github.com/samudoria/revoid) call `list_native_libraries`, then `extract_native_library`
+to get a `.so` path on disk, and pass that path to `load_binary` here. Each server keeps its own renames and comments.
+Tell the model to rename and comment as it goes; the notes are what the next analyst reads.
 
 ## Tools
 

@@ -117,7 +117,7 @@ def load_binary(path: str, analyze: bool = True) -> str:
     from ghidra.framework.model import ProjectLocator
     from ghidra.program.flatapi import FlatProgramAPI
     from ghidra.program.util import GhidraProgramUtilities
-    root = Path(os.environ.get("GHIDRA_MCP_HOME") or Path.home() / ".ghidra_mcp")
+    root = Path(os.environ.get("GHIDRA_MCP_HOME") or Path.home() / "ghidra_mcp")
     name = os.path.basename(path) + "_" + hashlib.sha1(path.encode()).hexdigest()[:8]
     loc = root / name
     if ProjectLocator(loc, name).exists():
@@ -253,19 +253,130 @@ def rename(target: str, new_name: str) -> str:
         return f"{a} -> {new_name}"
 
 
+def _var(function, name):
+    """(function, high symbol) for a variable as named in the decompiled C."""
+    f = _func(function)
+    syms = list(_decompile(f).getHighFunction().getLocalSymbolMap().getSymbols())
+    hits = [s for s in syms if s.getName() == name]
+    if not hits:
+        raise ValueError(f"No variable '{name}' in {f.getName()}. Have: {[s.getName() for s in syms]}")
+    return f, hits[0]
+
+
 @mcp.tool()
 def rename_variable(function: str, old_name: str, new_name: str) -> str:
     """Rename a local variable or parameter as shown in the decompiled C of `function`."""
     from ghidra.program.model.pcode import HighFunctionDBUtil
     from ghidra.program.model.symbol import SourceType
-    f = _func(function)
-    high = _decompile(f).getHighFunction()
-    syms = [s for s in high.getLocalSymbolMap().getSymbols() if s.getName() == old_name]
-    if not syms:
-        have = [s.getName() for s in high.getLocalSymbolMap().getSymbols()]
-        raise ValueError(f"No variable '{old_name}' in {f.getName()}. Have: {have}")
-    _edit("rename variable", lambda: HighFunctionDBUtil.updateDBVariable(syms[0], new_name, None, SourceType.USER_DEFINED))
+    f, sym = _var(function, old_name)
+    _edit("rename variable", lambda: HighFunctionDBUtil.updateDBVariable(sym, new_name, None, SourceType.USER_DEFINED))
     return f"{old_name} -> {new_name} in {f.getName()}"
+
+
+@mcp.tool()
+def retype_variable(function: str, variable: str, type: str) -> str:
+    """Change the type of a local/parameter as shown in the decompiled C, e.g. type='char *' or 'uint8_t[16]'."""
+    from ghidra.util.data import DataTypeParser
+    from ghidra.program.model.pcode import HighFunctionDBUtil
+    from ghidra.program.model.symbol import SourceType
+    f, sym = _var(function, variable)
+    dtm = _prog().getDataTypeManager()
+    dt = DataTypeParser(dtm, dtm, None, DataTypeParser.AllowedDataTypes.ALL).parse(type)
+    _edit("retype variable", lambda: HighFunctionDBUtil.updateDBVariable(sym, None, dt, SourceType.USER_DEFINED))
+    return f"{variable}: {dt.getName()} in {f.getName()}"
+
+
+@mcp.tool()
+def set_signature(function: str, signature: str) -> str:
+    """Apply a C prototype to a function, e.g. 'int check_license(char *key, int len)'.
+    Fixes return type, parameter names/types and count in the decompiled output."""
+    from ghidra.app.cmd.function import ApplyFunctionSignatureCmd
+    from ghidra.app.util.parser import FunctionSignatureParser
+    from ghidra.program.model.symbol import SourceType
+    p = _prog()
+    f = _func(function)
+    fd = FunctionSignatureParser(p.getDataTypeManager(), None).parse(f.getSignature(), signature)
+    cmd = ApplyFunctionSignatureCmd(f.getEntryPoint(), fd, SourceType.USER_DEFINED)
+    if not _edit("set signature", lambda: cmd.applyTo(p)):
+        raise RuntimeError(f"Could not apply signature: {cmd.getStatusMsg()}")
+    return f"{f.getName()}: {f.getPrototypeString(False, False)}"
+
+
+@mcp.tool()
+def read_memory(address: str, length: int = 64) -> str:
+    """Hex dump of `length` bytes (max 4096) at an address, e.g. to read a string table or JNI method table."""
+    a = _addr(address)
+    if a is None:
+        raise ValueError(f"Bad address '{address}'")
+    length = min(length, 4096)
+    from jpype import JArray, JByte
+    buf = JArray(JByte)(length)
+    n = _prog().memory.getBytes(a, buf)
+    data = bytes(b & 0xFF for b in buf[:n])
+    length = n
+    return "\n".join(f"{a.add(i)}  {data[i:i + 16].hex(' ')}" for i in range(0, length, 16))
+
+
+@mcp.tool()
+def search_bytes(pattern: str, limit: int = 50, offset: int = 0) -> str:
+    """Find a byte pattern in memory. Hex with '??' wildcards, e.g. '48 8b ?? 05' or 'deadbeef'."""
+    toks = re.findall(r"\?\?|[0-9a-fA-F]{2}", pattern)
+    if not toks or re.sub(r"\?\?|[0-9a-fA-F]{2}|\s", "", pattern):
+        raise ValueError("pattern must be hex bytes, optionally with ?? wildcards")
+    val = bytes(0 if t == "??" else int(t, 16) for t in toks)
+    mask = bytes(0 if t == "??" else 0xFF for t in toks)
+    p = _prog()
+    def gen():
+        a = p.minAddress
+        while a is not None:
+            a = p.memory.findBytes(a, val, mask, True, _monitor())
+            if a is None:
+                return
+            f = p.functionManager.getFunctionContaining(a)
+            yield {"address": str(a), "function": f.getName() if f else None}
+            a = a.next()
+    return _json(_page(gen(), limit, offset))
+
+
+@mcp.tool()
+def search_constants(value: str, limit: int = 50, offset: int = 0) -> str:
+    """Find instructions with a scalar operand equal to `value` (decimal or 0x hex): crypto constants, magic numbers, flags."""
+    from ghidra.program.model.scalar import Scalar
+    v = int(value, 0)
+    p = _prog()
+    def gen():
+        for ins in p.listing.getInstructions(True):
+            for i in range(ins.getNumOperands()):
+                if any(isinstance(o, Scalar) and v in (o.getValue(), o.getUnsignedValue()) for o in ins.getOpObjects(i)):
+                    f = p.functionManager.getFunctionContaining(ins.getAddress())
+                    yield {"address": str(ins.getAddress()), "instruction": str(ins), "function": f.getName() if f else None}
+                    break
+    return _json(_page(gen(), limit, offset))
+
+
+@mcp.tool()
+def call_path(source: str, target: str, max_depth: int = 10) -> str:
+    """Shortest call chain from function `source` to `target` (e.g. JNI_OnLoad -> some_sink), or null if none."""
+    s, t = _func(source), _func(target)
+    prev = {s.getEntryPoint(): None}
+    frontier = [s]
+    for _ in range(max_depth):
+        nxt = []
+        for f in frontier:
+            for c in f.getCalledFunctions(_monitor()):
+                if c.getEntryPoint() not in prev:
+                    prev[c.getEntryPoint()] = f
+                    nxt.append(c)
+        if t.getEntryPoint() in prev:
+            break
+        frontier = nxt
+    if t.getEntryPoint() not in prev:
+        return _json(None)
+    path, f = [], t
+    while f is not None:
+        path.append(_fn(f))
+        f = prev[f.getEntryPoint()]
+    return _json(path[::-1])  # ponytail: one shortest path only, enumerate all if ever needed
 
 
 @mcp.tool()

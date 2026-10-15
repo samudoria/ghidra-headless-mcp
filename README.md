@@ -23,6 +23,24 @@ pip install git+https://github.com/samudoria/ghidra-headless-mcp   # or the whee
 }
 ```
 
+### OpenCode
+
+In `opencode.json` (project) or `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "ghidra": {
+      "type": "local",
+      "command": ["ghidra-headless-mcp"],
+      "environment": { "GHIDRA_INSTALL_DIR": "/opt/ghidra" },
+      "enabled": true
+    }
+  }
+}
+```
+
 ## Use with Revoid
 
 For Android apps: in [Revoid](https://github.com/samudoria/revoid) call `list_native_libraries`, then `extract_native_library`
@@ -40,6 +58,12 @@ Tell the model to rename and comment as it goes; the notes are what the next ana
 | `list_strings` / `list_imports` / `list_exports` | Paginated, `filter` = regex. |
 | `get_callers` / `get_callees` | Call graph neighbours of a function. |
 | `get_xrefs` | References to an address, function or string. |
+| `call_path` | Shortest call chain from one function to another. |
+| `read_memory` | Hex dump of bytes at an address (max 4096). |
+| `search_bytes` | Byte pattern search, hex with `??` wildcards. Paginated. |
+| `search_constants` | Instructions with a given scalar operand (crypto constants, magic numbers). Paginated. |
+| `set_signature` | Apply a C prototype to a function (`int f(char *key, int n)`). |
+| `retype_variable` | Change a local/parameter type as seen in the decompiled C. |
 | `rename` | Rename a function or label. |
 | `rename_variable` | Rename a local/parameter seen in the decompiled C. |
 | `add_comment` | `pre` (default), `eol`, `post`, `plate`, `repeatable`. Empty text clears. |
@@ -52,7 +76,7 @@ Edits are saved to the Ghidra project immediately and survive restarts: reloadin
 | Variable | Purpose |
 |----------|---------|
 | `GHIDRA_INSTALL_DIR` (or `GHIDRA_HOME`) | Ghidra install directory (required) |
-| `GHIDRA_MCP_HOME` | Where projects are stored (default `~/.ghidra_mcp`) |
+| `GHIDRA_MCP_HOME` | Where projects are stored (default `~/ghidra_mcp`; no path element may start with `.`) |
 
 One binary is loaded at a time; `load_binary` closes the previous one. Only one server may open a given project at a time.
 Logs go to stderr; stdout is reserved for the protocol.

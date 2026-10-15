@@ -28,4 +28,11 @@ async def main(binary, fn):
         await call("list_strings", filter="s3cret")
         await call("list_imports")
         await call("get_disassembly", function="renamed_fn", max_lines=5)
+        addr = (await call("list_functions", filter="renamed_fn")).split('"address": "')[1].split('"')[0]
+        await call("read_memory", address=addr, length=16)
+        await call("search_bytes", pattern="?? ??", limit=2)
+        await call("search_constants", value="0x10", limit=2)
+        await call("call_path", source="renamed_fn", target="renamed_fn")
+        await call("set_signature", function="renamed_fn", signature="int renamed_fn(char *key)")
+        await call("retype_variable", function="renamed_fn", variable="key", type="char *")
 asyncio.run(main(*sys.argv[1:3]))

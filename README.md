@@ -77,6 +77,24 @@ Edits are saved to the Ghidra project immediately and survive restarts: reloadin
 |----------|---------|
 | `GHIDRA_INSTALL_DIR` (or `GHIDRA_HOME`) | Ghidra install directory (required) |
 | `GHIDRA_MCP_HOME` | Where projects are stored (default `~/ghidra_mcp`; no path element may start with `.`) |
+| `GHIDRA_MCP_TRANSPORT` | `stdio` (default), `sse`, or `streamable-http` |
+| `GHIDRA_MCP_HOST` / `GHIDRA_MCP_PORT` | Bind address for the HTTP transports (default `127.0.0.1:8000`) |
+
+### HTTP / SSE
+
+```bash
+GHIDRA_INSTALL_DIR=/opt/ghidra GHIDRA_MCP_TRANSPORT=sse ghidra-headless-mcp
+# SSE endpoint:        http://127.0.0.1:8000/sse
+# streamable-http:     GHIDRA_MCP_TRANSPORT=streamable-http  -> http://127.0.0.1:8000/mcp
+```
+
+```json
+{
+  "mcpServers": {
+    "ghidra": { "type": "sse", "url": "http://127.0.0.1:8000/sse" }
+  }
+}
+```
 
 One binary is loaded at a time; `load_binary` closes the previous one. Only one server may open a given project at a time.
 Logs go to stderr; stdout is reserved for the protocol.

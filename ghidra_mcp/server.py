@@ -402,7 +402,12 @@ def close():
 
 
 def main():
-    mcp.run()
+    # Transport: stdio (default), sse or streamable-http. Host/port via env for the HTTP ones.
+    transport = os.environ.get("GHIDRA_MCP_TRANSPORT", "stdio")
+    if transport != "stdio":
+        mcp.settings.host = os.environ.get("GHIDRA_MCP_HOST", "127.0.0.1")
+        mcp.settings.port = int(os.environ.get("GHIDRA_MCP_PORT", "8000"))
+    mcp.run(transport=transport)
 
 
 if __name__ == "__main__":

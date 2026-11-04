@@ -1,16 +1,26 @@
-"""Headless Ghidra MCP server (stdio). One binary loaded at a time; edits are saved immediately."""
-import hashlib, json, os, re, sys
+"""Headless Ghidra MCP server (stdio). One binary loaded at a time; edits are saved immediately.
+
+Load is non-blocking: load_binary imports the program (fast) and runs Ghidra auto-analysis on a
+background thread. Structural tools (exports/imports/strings/function list/memory) answer right
+after import; decompiler-driven tools return a soft {"status":"analyzing"} until analysis is done.
+Poll load_status() for the one clear ready signal. See PLAN.md for the state machine and locking."""
+import hashlib, json, os, re, sys, threading, time
 
 # JVM/Ghidra write to fd 1; keep it for MCP only and send everything else to stderr.
 _proto = os.fdopen(os.dup(1), "w")
 os.dup2(2, 1)
 sys.stdout = _proto  # mcp's stdio transport reads sys.stdout at run time
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
-mcp = FastMCP("ghidra-headless-mcp")
-S = {}  # prog, ifc (decompiler), proj (GhidraProject), path
+mcp = MCPServer("ghidra-headless-mcp")
+S = {}  # prog, ifc (decompiler), proj (GhidraProject), path, state, analyzed, analyze_start, analyze_err, thread
 COMMENTS = ("pre", "eol", "post", "plate", "repeatable")
+
+LOCK = threading.RLock()  # guards S (state + prog/ifc/proj refs) and serializes load_binary/close
+DEFAULT_DISABLE = "Embedded Media"  # trimmed only when GHIDRA_MCP_TRIM_ANALYSIS is set; see PLAN.md
+ANALYZING_HINT = ("analysis running in background; poll load_status. "
+                  "list_exports/list_imports/list_strings/list_functions/read_memory/search_bytes work now")
 
 
 def _home():
@@ -90,10 +100,20 @@ def _edit(label, fn):
             S["proj"].save(p)
 
 
-def _decompile(f):
-    res = S["ifc"].decompileFunction(f, 120, _monitor())
+def _dec_timeout(timeout):
+    if timeout and timeout > 0:
+        return int(timeout)
+    return int(os.environ.get("GHIDRA_MCP_DECOMPILE_TIMEOUT", "30"))
+
+
+def _decompile(f, timeout=0):
+    """Returns the decompile result, or None on timeout (caller renders a status)."""
+    res = S["ifc"].decompileFunction(f, _dec_timeout(timeout), _monitor())
     if not res.decompileCompleted():
-        raise RuntimeError("Decompile failed: " + str(res.getErrorMessage()))
+        msg = str(res.getErrorMessage())
+        if "timeout" in msg.lower() or "timed out" in msg.lower():
+            return None
+        raise RuntimeError("Decompile failed: " + msg)
     return res
 
 
@@ -101,22 +121,99 @@ def _json(x):
     return json.dumps(x, indent=1)
 
 
-@mcp.tool()
-def load_binary(path: str, analyze: bool = True) -> str:
-    """Load a native binary (.so, ELF, PE, Mach-O...) and run Ghidra auto-analysis. Must be called first.
-    The Ghidra project is cached, so edits (renames, comments) persist across sessions."""
-    import pyghidra
-    _home()
-    path = os.path.abspath(path)
-    if not os.path.isfile(path):
-        raise FileNotFoundError(path)
-    pyghidra.start()
-    close()
+# --- load state machine -----------------------------------------------------
+
+def _status_locked():
+    """Build the status dict. Caller holds LOCK."""
+    st = S.get("state", "idle")
+    d = {"state": st}
+    if "prog" in S:
+        p = S["prog"]
+        d["name"] = p.getName()
+        d["functions"] = p.functionManager.getFunctionCount()
+    if st == "analyzing":
+        d["elapsed_s"] = round(time.time() - S.get("analyze_start", time.time()), 1)
+    if st == "ready":
+        d["analyzed"] = bool(S.get("analyzed"))
+    if st == "error":
+        d["error"] = S.get("analyze_err", "")
+    return d
+
+
+def _retry_after():
+    el = time.time() - S.get("analyze_start", time.time())
+    return 5 if el < 20 else 3
+
+
+def _trim_analysis(prog):
+    names = [n.strip() for n in os.environ.get("GHIDRA_MCP_DISABLE_ANALYZERS", DEFAULT_DISABLE).split(",") if n.strip()]
+    if not names:
+        return
+    from ghidra.program.model.listing import Program
+    opts = prog.getOptions(Program.ANALYSIS_PROPERTIES)
+    tx = prog.startTransaction("trim analysis")
+    try:
+        for n in names:
+            if opts.contains(n):
+                opts.setBoolean(n, False)
+    finally:
+        prog.endTransaction(tx, True)
+
+
+def _analyze(prog, proj):
+    """Heavy, blocking full analysis. Kept small/overridable for testing."""
+    from ghidra.program.flatapi import FlatProgramAPI
+    from ghidra.program.util import GhidraProgramUtilities
+    if os.environ.get("GHIDRA_MCP_TRIM_ANALYSIS", "0") not in ("0", "", "false", "False"):
+        _trim_analysis(prog)
+    FlatProgramAPI(prog).analyzeAll(prog)
+    GhidraProgramUtilities.markProgramAnalyzed(prog)
+    proj.save(prog)
+
+
+def _analysis_thread(prog, proj):
+    try:
+        _analyze(prog, proj)
+        with LOCK:
+            if S.get("prog") is prog:
+                S.update(state="ready", analyzed=True, analyze_end=time.time())
+    except Exception as e:  # analysis failure surfaces via load_status / tool error
+        with LOCK:
+            if S.get("prog") is prog:
+                S.update(state="error", analyze_err=str(e))
+
+
+def _kick_analysis_locked():
+    """Start background analysis of the current program. Caller holds LOCK; program imported, not analyzed."""
+    S.update(state="analyzing", analyze_start=time.time())
+    S.pop("analyze_err", None)
+    t = threading.Thread(target=_analysis_thread, args=(S["prog"], S["proj"]), daemon=True)
+    S["thread"] = t
+    t.start()
+
+
+def _require_analysis():
+    """None if analysis-dependent tools may proceed, else a soft status JSON string to return as-is.
+    For a ready-but-unanalyzed program (analyze=False) this triggers analysis on demand."""
+    with LOCK:
+        st = S.get("state", "idle")
+        if st == "idle":
+            raise RuntimeError("No binary loaded. Call load_binary first.")
+        if st == "importing":
+            return _json({"status": "analyzing", "retry_after_s": 2, "hint": ANALYZING_HINT})
+        if st == "error":
+            raise RuntimeError("Analysis failed: " + S.get("analyze_err", ""))
+        if st == "ready" and S.get("analyzed"):
+            return None
+        if st == "ready":  # imported but not analyzed -> trigger on demand
+            _kick_analysis_locked()
+        return _json({"status": "analyzing", "retry_after_s": _retry_after(), "hint": ANALYZING_HINT})
+
+
+def _open_or_import(path):
     from pathlib import Path
     from ghidra.base.project import GhidraProject
     from ghidra.framework.model import ProjectLocator
-    from ghidra.program.flatapi import FlatProgramAPI
-    from ghidra.program.util import GhidraProgramUtilities
     root = Path(os.environ.get("GHIDRA_MCP_HOME") or Path.home() / "ghidra_mcp")
     name = os.path.basename(path) + "_" + hashlib.sha1(path.encode()).hexdigest()[:8]
     loc = root / name
@@ -133,35 +230,85 @@ def load_binary(path: str, analyze: bool = True) -> str:
         if prog is None:
             raise RuntimeError(f"Ghidra could not import {path} (unsupported format?)")
         proj.saveAs(prog, "/", fname, True)
-    if analyze and GhidraProgramUtilities.shouldAskToAnalyze(prog):
-        FlatProgramAPI(prog).analyzeAll(prog)
-        GhidraProgramUtilities.markProgramAnalyzed(prog)
-        proj.save(prog)
-    from ghidra.app.decompiler import DecompInterface
-    ifc = DecompInterface()
-    ifc.openProgram(prog)
-    S.update(prog=prog, ifc=ifc, proj=proj, path=path)
-    return _json({"name": prog.getName(), "language": str(prog.getLanguageID()), "image_base": str(prog.getImageBase()),
-                  "functions": prog.functionManager.getFunctionCount()})
+    return prog, proj
+
+
+@mcp.tool()
+def load_binary(path: str, analyze: bool = True) -> str:
+    """Load a native binary (.so, ELF, PE, Mach-O...). Must be called first. Returns immediately:
+    the import is synchronous but Ghidra auto-analysis runs in the background. Read
+    exports/imports/strings/function list right away; poll load_status() until {"state":"ready",
+    "analyzed":true} before decompiler-driven tools. With analyze=False, analysis is skipped and
+    started on demand the first time a decompiler tool is called. The project (and analysis) is
+    cached, so edits and analysis persist across sessions."""
+    import pyghidra
+    _home()
+    path = os.path.abspath(path)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(path)
+    with LOCK:
+        if S.get("state") == "analyzing":  # a previous load is still analyzing; don't disturb it
+            return _json(_status_locked())
+        if S.get("path") == path and S.get("state") == "ready":  # already loaded
+            if analyze and not S.get("analyzed"):
+                _kick_analysis_locked()
+            return _json(_status_locked())
+        pyghidra.start()
+        close_locked()
+        S["state"] = "importing"
+        from ghidra.program.util import GhidraProgramUtilities
+        from ghidra.app.decompiler import DecompInterface
+        prog, proj = _open_or_import(path)
+        already = not GhidraProgramUtilities.shouldAskToAnalyze(prog)
+        ifc = DecompInterface()
+        ifc.openProgram(prog)
+        S.update(prog=prog, ifc=ifc, proj=proj, path=path, state="ready", analyzed=already)
+        if analyze and not already:
+            _kick_analysis_locked()
+        return _json(_status_locked() | {"language": str(prog.getLanguageID()),
+                                         "image_base": str(prog.getImageBase())})
+
+
+@mcp.tool()
+def load_status() -> str:
+    """Current load state: idle / importing / analyzing / ready / error. The one signal to poll.
+    {"state":"ready","analyzed":true} means decompiler-driven tools are good to go; while
+    {"state":"analyzing",...} the structural tools (exports/imports/strings/function list) already work."""
+    with LOCK:
+        return _json(_status_locked())
 
 
 @mcp.tool()
 def list_functions(filter: str = "", limit: int = 50, offset: int = 0) -> str:
-    """List functions (name, address, signature). `filter` is a case-insensitive regex on the name."""
+    """List functions (name, address, signature). `filter` is a case-insensitive regex on the name.
+    Available right after import; the list grows as background analysis discovers more functions."""
     m = _match(filter)
     return _json(_page((_fn(f) for f in _prog().functionManager.getFunctions(True) if m(f.getName())), limit, offset))
 
 
 @mcp.tool()
-def get_function(function: str, max_chars: int = 20000) -> str:
-    """Decompiled C of a function. `function` = exact name or any address inside it (e.g. 0x101234)."""
-    c = _decompile(_func(function)).getDecompiledFunction().getC()
+def get_function(function: str, max_chars: int = 20000, timeout: int = 0) -> str:
+    """Decompiled C of a function. `function` = exact name or any address inside it (e.g. 0x101234).
+    Needs analysis: returns {"status":"analyzing"} until ready. `timeout` = per-call decompile seconds
+    (0 = GHIDRA_MCP_DECOMPILE_TIMEOUT, default 30; pass 120 for the old limit)."""
+    busy = _require_analysis()
+    if busy:
+        return busy
+    res = _decompile(_func(function), timeout)
+    if res is None:
+        return _json({"status": "timeout", "timeout_s": _dec_timeout(timeout), "function": function,
+                      "hint": "raise the timeout param (e.g. timeout=120)"})
+    c = res.getDecompiledFunction().getC()
     return c if len(c) <= max_chars else c[:max_chars] + f"\n/* truncated at {max_chars} of {len(c)} chars; raise max_chars */"
 
 
 @mcp.tool()
 def get_disassembly(function: str, max_lines: int = 500) -> str:
-    """Assembly listing of a function (address, instruction, comments)."""
+    """Assembly listing of a function (address, instruction, comments). Needs analysis: returns
+    {"status":"analyzing"} until ready."""
+    busy = _require_analysis()
+    if busy:
+        return busy
     p = _prog()
     f = _func(function)
     out = []
@@ -175,7 +322,8 @@ def get_disassembly(function: str, max_lines: int = 500) -> str:
 
 @mcp.tool()
 def list_strings(filter: str = "", limit: int = 50, offset: int = 0) -> str:
-    """List defined strings (address, value). `filter` is a case-insensitive regex on the value."""
+    """List defined strings (address, value). `filter` is a case-insensitive regex on the value.
+    Available right after import; the set grows as background analysis defines more strings."""
     m = _match(filter)
     def gen():
         for d in _prog().listing.getDefinedData(True):
@@ -188,7 +336,8 @@ def list_strings(filter: str = "", limit: int = 50, offset: int = 0) -> str:
 
 @mcp.tool()
 def list_imports(filter: str = "", limit: int = 50, offset: int = 0) -> str:
-    """List imported (external) symbols with their library. `filter` is a regex on the name."""
+    """List imported (external) symbols with their library. `filter` is a regex on the name.
+    Available right after import (no analysis needed)."""
     m = _match(filter)
     gen = ({"name": s.getName(), "library": s.getParentNamespace().getName()}
            for s in _prog().symbolTable.getExternalSymbols() if m(s.getName()))
@@ -197,7 +346,8 @@ def list_imports(filter: str = "", limit: int = 50, offset: int = 0) -> str:
 
 @mcp.tool()
 def list_exports(filter: str = "", limit: int = 50, offset: int = 0) -> str:
-    """List exported symbols (entry points). `filter` is a regex on the name."""
+    """List exported symbols (entry points). `filter` is a regex on the name.
+    Available right after import (no analysis needed)."""
     st = _prog().symbolTable
     m = _match(filter)
     def gen():
@@ -210,19 +360,29 @@ def list_exports(filter: str = "", limit: int = 50, offset: int = 0) -> str:
 
 @mcp.tool()
 def get_callers(function: str, limit: int = 50, offset: int = 0) -> str:
-    """Functions that call `function`."""
+    """Functions that call `function`. Needs analysis: returns {"status":"analyzing"} until ready."""
+    busy = _require_analysis()
+    if busy:
+        return busy
     return _json(_page((_fn(f) for f in _func(function).getCallingFunctions(_monitor())), limit, offset))
 
 
 @mcp.tool()
 def get_callees(function: str, limit: int = 50, offset: int = 0) -> str:
-    """Functions called by `function`."""
+    """Functions called by `function`. Needs analysis: returns {"status":"analyzing"} until ready."""
+    busy = _require_analysis()
+    if busy:
+        return busy
     return _json(_page((_fn(f) for f in _func(function).getCalledFunctions(_monitor())), limit, offset))
 
 
 @mcp.tool()
 def get_xrefs(target: str, limit: int = 50, offset: int = 0) -> str:
-    """References to an address, string, global or function. `target` = address or function name."""
+    """References to an address, string, global or function. `target` = address or function name.
+    Needs analysis: returns {"status":"analyzing"} until ready."""
+    busy = _require_analysis()
+    if busy:
+        return busy
     p = _prog()
     a = _addr(target)
     if a is None:
@@ -237,7 +397,11 @@ def get_xrefs(target: str, limit: int = 50, offset: int = 0) -> str:
 @mcp.tool()
 def rename(target: str, new_name: str) -> str:
     """Rename a function (by name/address) or, for a non-function address, create/replace its label.
-    Do this often: good names are the most valuable output for the next analyst."""
+    Do this often: good names are the most valuable output for the next analyst.
+    Needs analysis (edits the program): returns {"status":"analyzing"} until ready."""
+    busy = _require_analysis()
+    if busy:
+        return busy
     from ghidra.program.model.symbol import SourceType
     p = _prog()
     try:
@@ -256,7 +420,10 @@ def rename(target: str, new_name: str) -> str:
 def _var(function, name):
     """(function, high symbol) for a variable as named in the decompiled C."""
     f = _func(function)
-    syms = list(_decompile(f).getHighFunction().getLocalSymbolMap().getSymbols())
+    res = _decompile(f)
+    if res is None:
+        raise RuntimeError(f"Decompilation of {f.getName()} timed out; raise GHIDRA_MCP_DECOMPILE_TIMEOUT")
+    syms = list(res.getHighFunction().getLocalSymbolMap().getSymbols())
     hits = [s for s in syms if s.getName() == name]
     if not hits:
         raise ValueError(f"No variable '{name}' in {f.getName()}. Have: {[s.getName() for s in syms]}")
@@ -265,7 +432,11 @@ def _var(function, name):
 
 @mcp.tool()
 def rename_variable(function: str, old_name: str, new_name: str) -> str:
-    """Rename a local variable or parameter as shown in the decompiled C of `function`."""
+    """Rename a local variable or parameter as shown in the decompiled C of `function`.
+    Needs analysis: returns {"status":"analyzing"} until ready."""
+    busy = _require_analysis()
+    if busy:
+        return busy
     from ghidra.program.model.pcode import HighFunctionDBUtil
     from ghidra.program.model.symbol import SourceType
     f, sym = _var(function, old_name)
@@ -275,7 +446,11 @@ def rename_variable(function: str, old_name: str, new_name: str) -> str:
 
 @mcp.tool()
 def retype_variable(function: str, variable: str, type: str) -> str:
-    """Change the type of a local/parameter as shown in the decompiled C, e.g. type='char *' or 'uint8_t[16]'."""
+    """Change the type of a local/parameter as shown in the decompiled C, e.g. type='char *' or 'uint8_t[16]'.
+    Needs analysis: returns {"status":"analyzing"} until ready."""
+    busy = _require_analysis()
+    if busy:
+        return busy
     from ghidra.util.data import DataTypeParser
     from ghidra.program.model.pcode import HighFunctionDBUtil
     from ghidra.program.model.symbol import SourceType
@@ -289,7 +464,11 @@ def retype_variable(function: str, variable: str, type: str) -> str:
 @mcp.tool()
 def set_signature(function: str, signature: str) -> str:
     """Apply a C prototype to a function, e.g. 'int check_license(char *key, int len)'.
-    Fixes return type, parameter names/types and count in the decompiled output."""
+    Fixes return type, parameter names/types and count in the decompiled output.
+    Needs analysis: returns {"status":"analyzing"} until ready."""
+    busy = _require_analysis()
+    if busy:
+        return busy
     from ghidra.app.cmd.function import ApplyFunctionSignatureCmd
     from ghidra.app.util.parser import FunctionSignatureParser
     from ghidra.program.model.symbol import SourceType
@@ -304,7 +483,8 @@ def set_signature(function: str, signature: str) -> str:
 
 @mcp.tool()
 def read_memory(address: str, length: int = 64) -> str:
-    """Hex dump of `length` bytes (max 4096) at an address, e.g. to read a string table or JNI method table."""
+    """Hex dump of `length` bytes (max 4096) at an address, e.g. to read a string table or JNI method table.
+    Available right after import (raw memory, no analysis needed)."""
     a = _addr(address)
     if a is None:
         raise ValueError(f"Bad address '{address}'")
@@ -319,7 +499,8 @@ def read_memory(address: str, length: int = 64) -> str:
 
 @mcp.tool()
 def search_bytes(pattern: str, limit: int = 50, offset: int = 0) -> str:
-    """Find a byte pattern in memory. Hex with '??' wildcards, e.g. '48 8b ?? 05' or 'deadbeef'."""
+    """Find a byte pattern in memory. Hex with '??' wildcards, e.g. '48 8b ?? 05' or 'deadbeef'.
+    Available right after import (raw memory scan, no analysis needed)."""
     toks = re.findall(r"\?\?|[0-9a-fA-F]{2}", pattern)
     if not toks or re.sub(r"\?\?|[0-9a-fA-F]{2}|\s", "", pattern):
         raise ValueError("pattern must be hex bytes, optionally with ?? wildcards")
@@ -340,7 +521,11 @@ def search_bytes(pattern: str, limit: int = 50, offset: int = 0) -> str:
 
 @mcp.tool()
 def search_constants(value: str, limit: int = 50, offset: int = 0) -> str:
-    """Find instructions with a scalar operand equal to `value` (decimal or 0x hex): crypto constants, magic numbers, flags."""
+    """Find instructions with a scalar operand equal to `value` (decimal or 0x hex): crypto constants,
+    magic numbers, flags. Needs analysis (iterates instructions): returns {"status":"analyzing"} until ready."""
+    busy = _require_analysis()
+    if busy:
+        return busy
     from ghidra.program.model.scalar import Scalar
     v = int(value, 0)
     p = _prog()
@@ -356,7 +541,11 @@ def search_constants(value: str, limit: int = 50, offset: int = 0) -> str:
 
 @mcp.tool()
 def call_path(source: str, target: str, max_depth: int = 10) -> str:
-    """Shortest call chain from function `source` to `target` (e.g. JNI_OnLoad -> some_sink), or null if none."""
+    """Shortest call chain from function `source` to `target` (e.g. JNI_OnLoad -> some_sink), or null if none.
+    Needs analysis: returns {"status":"analyzing"} until ready."""
+    busy = _require_analysis()
+    if busy:
+        return busy
     s, t = _func(source), _func(target)
     prev = {s.getEntryPoint(): None}
     frontier = [s]
@@ -382,7 +571,11 @@ def call_path(source: str, target: str, max_depth: int = 10) -> str:
 @mcp.tool()
 def add_comment(target: str, text: str, kind: str = "pre") -> str:
     """Add a comment at an address or function entry. kind: pre (default, shown above the line in the
-    decompiler), eol, post, plate, repeatable. Empty text clears it. Use liberally to document findings."""
+    decompiler), eol, post, plate, repeatable. Empty text clears it. Use liberally to document findings.
+    Needs analysis (edits the program): returns {"status":"analyzing"} until ready."""
+    busy = _require_analysis()
+    if busy:
+        return busy
     from ghidra.program.model.listing import CodeUnit
     if kind not in COMMENTS:
         raise ValueError(f"kind must be one of {COMMENTS}")
@@ -394,20 +587,27 @@ def add_comment(target: str, text: str, kind: str = "pre") -> str:
     return f"{kind} comment set at {a}"
 
 
-def close():
+def close_locked():
+    """Dispose the current program/project. Caller holds LOCK. Never called while analyzing."""
     if "proj" in S:
         S["ifc"].dispose()
         S["proj"].close()
-        S.clear()
+    S.clear()
+
+
+def close():
+    with LOCK:
+        close_locked()
 
 
 def main():
     # Transport: stdio (default), sse or streamable-http. Host/port via env for the HTTP ones.
     transport = os.environ.get("GHIDRA_MCP_TRANSPORT", "stdio")
+    kwargs = {}
     if transport != "stdio":
-        mcp.settings.host = os.environ.get("GHIDRA_MCP_HOST", "127.0.0.1")
-        mcp.settings.port = int(os.environ.get("GHIDRA_MCP_PORT", "8000"))
-    mcp.run(transport=transport)
+        kwargs["host"] = os.environ.get("GHIDRA_MCP_HOST", "127.0.0.1")
+        kwargs["port"] = int(os.environ.get("GHIDRA_MCP_PORT", "8000"))
+    mcp.run(transport=transport, **kwargs)
 
 
 if __name__ == "__main__":

@@ -13,7 +13,24 @@ async def main(binary, fn):
             assert not res.isError, t
             print(f"--- {n}\n{t[:600]}")
             return t
-        await call("load_binary", path=binary)
+        import json
+        ld = json.loads(await call("load_binary", path=binary))
+        # structural tools must work while analysis is still running in the background
+        if ld.get("state") == "analyzing":
+            assert "items" in json.loads(await call("list_exports")), "exports should work during analyzing"
+            await call("list_imports")
+            # a decompiler-driven tool returns the soft status, not a wrong answer
+            gf = await call("get_function", function=fn)
+            assert '"status": "analyzing"' in gf, f"expected analyzing status, got: {gf[:200]}"
+        # poll load_status until ready
+        for _ in range(600):
+            st = json.loads(await call("load_status"))
+            if st.get("state") == "ready" and st.get("analyzed"):
+                break
+            assert st.get("state") != "error", st
+            await asyncio.sleep(1)
+        else:
+            raise AssertionError("analysis did not finish in 600s")
         await call("list_functions", filter=fn)
         await call("get_function", function=fn)
         if fn != "renamed_fn":

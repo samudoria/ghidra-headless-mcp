@@ -11,7 +11,7 @@ model is stuck even though exports/imports/strings/symbol list need no full anal
 
 ## Design
 
-### Load state machine (in `S`, guarded by `LOCK`)
+### Load state machine (per session, guarded by that session's `LOCK`)
 ```
 idle --load_binary--> importing --(import done)--> ready
                                                      |  analyze needed & not done
@@ -19,12 +19,26 @@ idle --load_binary--> importing --(import done)--> ready
                                                  analyzing --(bg thread done)--> ready(analyzed)
                                  (any step fails) --> error
 ```
+- `SESSIONS`: `abspath -> session`; each session has its own `lock`, `prog`, `ifc`, `proj`,
+  `state`, `analyzed`, timing, `thread`.
+- `ACTIVE`: abspath of the most recently loaded binary — the default when a tool omits `binary`.
 - `S["state"]`: `idle | importing | analyzing | ready | error`
 - `S["analyzed"]`: bool — program has had full auto-analysis (distinct from `ready`,
   because `analyze=False` reaches `ready` *un*analyzed).
-- `load_status()` tool returns the single checkable object:
-  `{"state":"ready","analyzed":true,"name":..,"functions":N}` is the go signal;
+- `load_status(binary="")` tool returns the single checkable object:
+  `{"id":..,"state":"ready","analyzed":true,"name":..,"functions":N}` is the go signal;
   `{"state":"analyzing","elapsed_s":N,"functions":M}` while running.
+- `list_binaries()` returns every session plus `active`; `unload_binary(binary="")` frees one.
+
+### Multiple binaries
+- `load_binary` adds to `SESSIONS` instead of closing the previous binary; `ACTIVE` moves to the
+  newly loaded one. Loading an already-loaded path returns its status (kicking analysis if needed).
+- **Imports are serialized** under `IMPORT_LOCK` (`pyghidra.start` + project open/import are not
+  thread-safe in one JVM). **Analysis threads run concurrently** across sessions, and queries on
+  one binary are independent of another binary's analysis.
+- Selector resolution (`_session`): exact abspath, else basename or program name; ambiguous matches
+  raise with the candidate ids; empty = `ACTIVE`.
+- `unload_binary` refuses while that session is analyzing (disposing mid-analysis is unsafe).
 
 `load_binary(path, analyze=True)`:
 1. `pyghidra.start()`, open/create cached project, import program (or open cached),
@@ -35,9 +49,9 @@ idle --load_binary--> importing --(import done)--> ready
 Returns `{"state","name","functions","language","image_base","analyzed"}` (superset of
 the old shape — only added fields).
 
-Re-entrancy: a second `load_binary` while `state=="analyzing"` returns the current
-status and does not disturb the running analysis. The whole import runs under `LOCK`,
-so two imports cannot interleave.
+Re-entrancy: a second `load_binary` for a path that is already `importing`/`analyzing` returns
+that session's status and does not disturb the running work. Imports for different paths are
+serialized by `IMPORT_LOCK`; their analyses then run in parallel.
 
 ### Per-tool needs-analysis classification
 
@@ -77,13 +91,15 @@ Ghidra's program DB handles read/write concurrency, worst case a structural read
 analysis-in-progress (more symbols appearing) — acceptable, documented ceiling.
 
 ### Locking
-- `LOCK` (`threading.RLock`) guards every read/write of `S` (state, analyzed, timing,
-  thread handle, prog/ifc/proj references) and serializes `load_binary`/`close`.
-- The background analysis thread runs `analyzeAll` **without** holding `LOCK` (it would
-  block everything for minutes); it takes `LOCK` only briefly to flip `analyzing→ready`
-  / `→error`, and only if it is still the current program.
-- Invariant: at most one analysis thread; `S["prog"]` does not change while `analyzing`
-  (new loads return busy), so the single-writer guarantee holds.
+- `REGISTRY_LOCK` (`threading.RLock`) guards `SESSIONS`/`ACTIVE` only.
+- Each session has its own `RLock` guarding that session's state, prog/ifc/proj refs and edits.
+- `IMPORT_LOCK` serializes `pyghidra.start` and project open/import across sessions.
+- Lock order: `REGISTRY_LOCK` → `IMPORT_LOCK` → session lock (never reverse).
+- The background analysis thread runs `analyzeAll` **without** holding its session lock (it would
+  block everything for minutes); it takes the lock only briefly to flip `analyzing→ready`/`→error`,
+  and only if it is still the current program for that session.
+- Invariant: at most one analysis thread per session; a session's `prog` does not change while it is
+  analyzing. Different sessions analyze concurrently.
 
 ### Phase 3
 - **`analyze=False`**: imports and returns `ready` (unanalyzed), no `analyzeAll`.
@@ -110,5 +126,7 @@ starts analysis itself.
 
 ## Tests
 - `tests/test_state.py` — pure Python, no JVM: state transitions, soft-status gating,
-  `analyze=False` no-analysis, cached-analyzed → ready, timeout-status shape.
-- `tests/smoke.py` — extended e2e (needs Ghidra): `load_status`, analyzing→ready poll.
+  `analyze=False` no-analysis, cached-analyzed → ready, timeout-status shape, multi-binary
+  selector resolution/isolation, parallel analysis, unload.
+- `tests/smoke.py` — extended e2e (needs Ghidra): `load_status`, analyzing→ready poll, and
+  (with a second binary) concurrent multi-binary load/query/unload.

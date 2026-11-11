@@ -51,8 +51,10 @@ Tell the model to rename and comment as it goes; the notes are what the next ana
 
 | Tool | Description |
 |------|-------------|
-| `load_binary` | Import a binary (ELF/.so, PE, Mach-O...) and start auto-analysis **in the background**. **Call first.** Returns immediately. Cached per file. `analyze=False` skips analysis (started on demand). |
+| `load_binary` | Import a binary (ELF/.so, PE, Mach-O...) and start auto-analysis **in the background**. **Call first.** Returns immediately. Cached per file. `analyze=False` skips analysis (started on demand). Several binaries may be loaded at once. |
 | `load_status` | Load state: `idle`/`importing`/`analyzing`/`ready`/`error`. Poll until `{"state":"ready","analyzed":true}`. |
+| `list_binaries` | All loaded binaries (id/path/name/state/analyzed/functions) and which one is active. |
+| `unload_binary` | Free one loaded binary (refused while it is still analyzing). |
 | `list_functions` | Functions (name, address, signature); `filter` = regex. Paginated. Works right after import. |
 | `get_function` | Decompiled C (`function` = name or any address inside). |
 | `get_disassembly` | Assembly listing of a function. |
@@ -71,6 +73,26 @@ Tell the model to rename and comment as it goes; the notes are what the next ana
 
 All lists take `limit` (default 50) and `offset`; the reply contains `next_offset` (null at the end).
 Edits are saved to the Ghidra project immediately and survive restarts: reloading the same file reopens your names and comments.
+
+Every tool also takes an optional `binary` selector: an absolute path, a basename, or a program name
+(see `list_binaries` for ids). Omitted = the most recently loaded binary, so single-binary use is unchanged.
+Loading a new binary no longer closes the previous one; use `unload_binary` to free one.
+
+## Multiple binaries
+
+`load_binary` can be called repeatedly and each binary keeps its own analysis thread, decompiler and
+edits. Imports are serialized (Ghidra project code is not thread-safe) but analysis and queries run in
+parallel, so agents can load several libraries and work on them concurrently. Select one per call:
+
+```python
+load_binary("/tmp/liba.so")
+load_binary("/tmp/libb.so")          # liba stays loaded and keeps analyzing
+list_binaries()                       # ids + states; libb is active
+list_exports(binary="liba.so")        # by basename
+get_function("JNI_OnLoad", binary="/tmp/libb.so")
+load_status(binary="libb.so")         # poll each binary independently
+unload_binary(binary="liba.so")
+```
 
 ## Load flow (non-blocking)
 
@@ -117,7 +139,7 @@ GHIDRA_INSTALL_DIR=/opt/ghidra GHIDRA_MCP_TRANSPORT=sse ghidra-headless-mcp
 }
 ```
 
-One binary is loaded at a time; `load_binary` closes the previous one. Only one server may open a given project at a time.
+Several binaries may be loaded at a time; `unload_binary` frees one. Only one server may open a given project at a time.
 Logs go to stderr; stdout is reserved for the protocol.
 
 ## Test
@@ -125,4 +147,5 @@ Logs go to stderr; stdout is reserved for the protocol.
 ```bash
 python tests/test_state.py                                                      # state machine, no Ghidra needed
 GHIDRA_INSTALL_DIR=/opt/ghidra python tests/smoke.py ./some_binary some_function # end-to-end over stdio
+GHIDRA_INSTALL_DIR=/opt/ghidra python tests/smoke.py ./liba.so fn_a ./libb.so fn_b # + multi-binary flow
 ```

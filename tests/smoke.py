@@ -1,16 +1,21 @@
-"""End-to-end check over stdio. Usage: GHIDRA_INSTALL_DIR=... python tests/smoke.py <binary> <function>"""
+"""End-to-end check over stdio.
+
+Usage: GHIDRA_INSTALL_DIR=... python tests/smoke.py <binary> <function> [<binary2> <function2>]
+
+With a second binary it also exercises multi-binary loading: both are loaded at once, each is
+queried through its `binary` selector, and one is unloaded without disturbing the other."""
 import asyncio, os, sys
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-async def main(binary, fn):
+async def main(binary, fn, binary2=None, fn2=None):
     p = StdioServerParameters(command=sys.executable, args=["-m", "ghidra_mcp.server"], env=dict(os.environ))
     async with stdio_client(p) as (r, w), ClientSession(r, w) as s:
         await s.initialize()
         async def call(n, **a):
             res = await s.call_tool(n, a)
             t = res.content[0].text
-            assert not res.isError, t
+            assert not res.is_error, t
             print(f"--- {n}\n{t[:600]}")
             return t
         import json
@@ -52,4 +57,27 @@ async def main(binary, fn):
         await call("call_path", source="renamed_fn", target="renamed_fn")
         await call("set_signature", function="renamed_fn", signature="int renamed_fn(char *key)")
         await call("retype_variable", function="renamed_fn", variable="key", type="char *")
-asyncio.run(main(*sys.argv[1:3]))
+
+        if binary2:
+            first_id = ld["id"]
+            ld2 = json.loads(await call("load_binary", path=binary2))
+            assert ld2["id"] != first_id
+            # both binaries are loaded at once; the first one is still queryable by selector
+            await call("list_binaries")
+            await call("list_functions", filter=fn2 or "", binary=first_id)
+            await call("get_function", function="renamed_fn", binary=first_id)
+            # poll the second binary independently
+            for _ in range(600):
+                st = json.loads(await call("load_status", binary=ld2["id"]))
+                if st.get("state") == "ready" and st.get("analyzed"):
+                    break
+                assert st.get("state") != "error", st
+                await asyncio.sleep(1)
+            else:
+                raise AssertionError("second analysis did not finish in 600s")
+            await call("get_function", function=fn2, binary=ld2["id"])
+            # unloading the second leaves the first intact
+            await call("unload_binary", binary=ld2["id"])
+            assert "renamed_fn" in await call("get_function", function="renamed_fn", binary=first_id)
+
+asyncio.run(main(*sys.argv[1:5]))

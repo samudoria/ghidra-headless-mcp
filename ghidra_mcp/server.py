@@ -1,9 +1,11 @@
-"""Headless Ghidra MCP server (stdio). One binary loaded at a time; edits are saved immediately.
+"""Headless Ghidra MCP server (stdio). Several binaries can be loaded at once; edits are saved immediately.
 
 Load is non-blocking: load_binary imports the program (fast) and runs Ghidra auto-analysis on a
-background thread. Structural tools (exports/imports/strings/function list/memory) answer right
-after import; decompiler-driven tools return a soft {"status":"analyzing"} until analysis is done.
-Poll load_status() for the one clear ready signal. See PLAN.md for the state machine and locking."""
+background thread. Imports are serialized (Ghidra project code is not thread-safe); analysis and
+queries run in parallel across binaries. Structural tools (exports/imports/strings/function
+list/memory) answer right after import; decompiler-driven tools return a soft {"status":"analyzing"}
+until analysis is done. Poll load_status() for the ready signal. Every tool takes an optional
+`binary` selector (path, basename or program name); omitted = most recently loaded. See PLAN.md."""
 import hashlib, json, os, re, sys, threading, time
 
 # JVM/Ghidra write to fd 1; keep it for MCP only and send everything else to stderr.
@@ -14,10 +16,12 @@ sys.stdout = _proto  # mcp's stdio transport reads sys.stdout at run time
 from mcp.server.mcpserver import MCPServer
 
 mcp = MCPServer("ghidra-headless-mcp")
-S = {}  # prog, ifc (decompiler), proj (GhidraProject), path, state, analyzed, analyze_start, analyze_err, thread
+SESSIONS = {}  # abspath -> {id, path, name, lock, prog, ifc, proj, state, analyzed, analyze_start, analyze_end, analyze_err, thread}
+ACTIVE = None  # abspath of the most recently loaded binary
+REGISTRY_LOCK = threading.RLock()  # guards SESSIONS/ACTIVE
+IMPORT_LOCK = threading.Lock()  # serializes pyghidra.start + project open/import (not thread-safe)
+_STARTED = False
 COMMENTS = ("pre", "eol", "post", "plate", "repeatable")
-
-LOCK = threading.RLock()  # guards S (state + prog/ifc/proj refs) and serializes load_binary/close
 DEFAULT_DISABLE = "Embedded Media"  # trimmed only when GHIDRA_MCP_TRIM_ANALYSIS is set; see PLAN.md
 ANALYZING_HINT = ("analysis running in background; poll load_status. "
                   "list_exports/list_imports/list_strings/list_functions/read_memory/search_bytes work now")
@@ -30,10 +34,34 @@ def _home():
     os.environ["GHIDRA_INSTALL_DIR"] = h
 
 
-def _prog():
-    if "prog" not in S:
-        raise RuntimeError("No binary loaded. Call load_binary first.")
-    return S["prog"]
+def _new_session(path):
+    return {"id": path, "path": path, "lock": threading.RLock(), "state": "importing"}
+
+
+def _session(binary=""):
+    """Resolve a binary selector to its session. Empty = most recently loaded."""
+    with REGISTRY_LOCK:
+        if not SESSIONS:
+            raise RuntimeError("No binary loaded. Call load_binary first.")
+        if not binary:
+            return SESSIONS[ACTIVE] if ACTIVE in SESSIONS else next(reversed(SESSIONS.values()))
+        if binary in SESSIONS:
+            return SESSIONS[binary]
+        hits = [s for s in SESSIONS.values()
+                if os.path.basename(s["path"]) == binary or s.get("name") == binary]
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            raise ValueError(f"'{binary}' is ambiguous; use one of: " + ", ".join(s["id"] for s in hits))
+        raise ValueError(f"No loaded binary '{binary}'. Loaded: " + ", ".join(s["id"] for s in SESSIONS.values()))
+
+
+def _prog(binary=""):
+    sess = _session(binary)
+    with sess["lock"]:
+        if "prog" not in sess:
+            raise RuntimeError(f"{sess['path']} is still importing; poll load_status.")
+        return sess["prog"]
 
 
 def _monitor():
@@ -59,22 +87,22 @@ def _match(filter_):
     return lambda s: bool(rx.search(s))
 
 
-def _addr(s):
+def _addr(s, binary=""):
     try:
-        return _prog().addressFactory.getAddress(s)
+        return _prog(binary).addressFactory.getAddress(s)
     except Exception:
         return None
 
 
-def _func(target):
+def _func(target, binary=""):
     """Resolve a function by exact name or by any address inside it."""
-    fm = _prog().functionManager
+    fm = _prog(binary).functionManager
     hits = [f for f in fm.getFunctions(True) if f.getName() == target]
     if len(hits) == 1:
         return hits[0]
     if len(hits) > 1:
         raise ValueError(f"'{target}' is ambiguous; use an address: " + ", ".join(str(f.getEntryPoint()) for f in hits[:10]))
-    a = _addr(target)
+    a = _addr(target, binary)
     f = fm.getFunctionContaining(a) if a else None
     if f is None:
         near = [f.getName() for f in fm.getFunctions(True) if target.lower() in f.getName().lower()][:10]
@@ -86,18 +114,20 @@ def _fn(f):
     return {"name": f.getName(), "address": str(f.getEntryPoint()), "signature": f.getPrototypeString(False, False)}
 
 
-def _edit(label, fn):
-    p = _prog()
-    tx = p.startTransaction(label)
-    ok = False
-    try:
-        r = fn()
-        ok = True
-        return r
-    finally:
-        p.endTransaction(tx, ok)
-        if ok:
-            S["proj"].save(p)
+def _edit(label, fn, binary=""):
+    sess = _session(binary)
+    with sess["lock"]:
+        p = sess["prog"]
+        tx = p.startTransaction(label)
+        ok = False
+        try:
+            r = fn()
+            ok = True
+            return r
+        finally:
+            p.endTransaction(tx, ok)
+            if ok:
+                sess["proj"].save(p)
 
 
 def _dec_timeout(timeout):
@@ -106,9 +136,10 @@ def _dec_timeout(timeout):
     return int(os.environ.get("GHIDRA_MCP_DECOMPILE_TIMEOUT", "30"))
 
 
-def _decompile(f, timeout=0):
+def _decompile(f, timeout=0, binary=""):
     """Returns the decompile result, or None on timeout (caller renders a status)."""
-    res = S["ifc"].decompileFunction(f, _dec_timeout(timeout), _monitor())
+    sess = _session(binary)
+    res = sess["ifc"].decompileFunction(f, _dec_timeout(timeout), _monitor())
     if not res.decompileCompleted():
         msg = str(res.getErrorMessage())
         if "timeout" in msg.lower() or "timed out" in msg.lower():
@@ -123,25 +154,26 @@ def _json(x):
 
 # --- load state machine -----------------------------------------------------
 
-def _status_locked():
-    """Build the status dict. Caller holds LOCK."""
-    st = S.get("state", "idle")
-    d = {"state": st}
-    if "prog" in S:
-        p = S["prog"]
-        d["name"] = p.getName()
-        d["functions"] = p.functionManager.getFunctionCount()
-    if st == "analyzing":
-        d["elapsed_s"] = round(time.time() - S.get("analyze_start", time.time()), 1)
-    if st == "ready":
-        d["analyzed"] = bool(S.get("analyzed"))
-    if st == "error":
-        d["error"] = S.get("analyze_err", "")
-    return d
+def _status(sess):
+    """Build the status dict for one session."""
+    with sess["lock"]:
+        st = sess.get("state", "idle")
+        d = {"id": sess["id"], "state": st}
+        if "prog" in sess:
+            p = sess["prog"]
+            d["name"] = p.getName()
+            d["functions"] = p.functionManager.getFunctionCount()
+        if st == "analyzing":
+            d["elapsed_s"] = round(time.time() - sess.get("analyze_start", time.time()), 1)
+        if st == "ready":
+            d["analyzed"] = bool(sess.get("analyzed"))
+        if st == "error":
+            d["error"] = sess.get("analyze_err", "")
+        return d
 
 
-def _retry_after():
-    el = time.time() - S.get("analyze_start", time.time())
+def _retry_after(sess):
+    el = time.time() - sess.get("analyze_start", time.time())
     return 5 if el < 20 else 3
 
 
@@ -171,43 +203,45 @@ def _analyze(prog, proj):
     proj.save(prog)
 
 
-def _analysis_thread(prog, proj):
+def _analysis_thread(sess):
+    prog, proj = sess["prog"], sess["proj"]
     try:
         _analyze(prog, proj)
-        with LOCK:
-            if S.get("prog") is prog:
-                S.update(state="ready", analyzed=True, analyze_end=time.time())
+        with sess["lock"]:
+            if sess.get("prog") is prog:
+                sess.update(state="ready", analyzed=True, analyze_end=time.time())
     except Exception as e:  # analysis failure surfaces via load_status / tool error
-        with LOCK:
-            if S.get("prog") is prog:
-                S.update(state="error", analyze_err=str(e))
+        with sess["lock"]:
+            if sess.get("prog") is prog:
+                sess.update(state="error", analyze_err=str(e))
 
 
-def _kick_analysis_locked():
-    """Start background analysis of the current program. Caller holds LOCK; program imported, not analyzed."""
-    S.update(state="analyzing", analyze_start=time.time())
-    S.pop("analyze_err", None)
-    t = threading.Thread(target=_analysis_thread, args=(S["prog"], S["proj"]), daemon=True)
-    S["thread"] = t
+def _kick_analysis_locked(sess):
+    """Start background analysis of a session. Caller holds sess["lock"]; program imported, not analyzed."""
+    sess.update(state="analyzing", analyze_start=time.time())
+    sess.pop("analyze_err", None)
+    t = threading.Thread(target=_analysis_thread, args=(sess,), daemon=True)
+    sess["thread"] = t
     t.start()
 
 
-def _require_analysis():
+def _require_analysis(binary=""):
     """None if analysis-dependent tools may proceed, else a soft status JSON string to return as-is.
     For a ready-but-unanalyzed program (analyze=False) this triggers analysis on demand."""
-    with LOCK:
-        st = S.get("state", "idle")
+    sess = _session(binary)
+    with sess["lock"]:
+        st = sess.get("state", "idle")
         if st == "idle":
             raise RuntimeError("No binary loaded. Call load_binary first.")
         if st == "importing":
             return _json({"status": "analyzing", "retry_after_s": 2, "hint": ANALYZING_HINT})
         if st == "error":
-            raise RuntimeError("Analysis failed: " + S.get("analyze_err", ""))
-        if st == "ready" and S.get("analyzed"):
+            raise RuntimeError("Analysis failed: " + sess.get("analyze_err", ""))
+        if st == "ready" and sess.get("analyzed"):
             return None
         if st == "ready":  # imported but not analyzed -> trigger on demand
-            _kick_analysis_locked()
-        return _json({"status": "analyzing", "retry_after_s": _retry_after(), "hint": ANALYZING_HINT})
+            _kick_analysis_locked(sess)
+        return _json({"status": "analyzing", "retry_after_s": _retry_after(sess), "hint": ANALYZING_HINT})
 
 
 def _open_or_import(path):
@@ -233,68 +267,129 @@ def _open_or_import(path):
     return prog, proj
 
 
+def _dispose_session(sess):
+    """Dispose the session's program/project. Caller holds sess["lock"] and it is not analyzing."""
+    if "ifc" in sess:
+        sess["ifc"].dispose()
+    if "proj" in sess:
+        sess["proj"].close()
+    for k in ("prog", "ifc", "proj", "thread"):
+        sess.pop(k, None)
+
+
 @mcp.tool()
 def load_binary(path: str, analyze: bool = True) -> str:
-    """Load a native binary (.so, ELF, PE, Mach-O...). Must be called first. Returns immediately:
-    the import is synchronous but Ghidra auto-analysis runs in the background. Read
-    exports/imports/strings/function list right away; poll load_status() until {"state":"ready",
-    "analyzed":true} before decompiler-driven tools. With analyze=False, analysis is skipped and
-    started on demand the first time a decompiler tool is called. The project (and analysis) is
-    cached, so edits and analysis persist across sessions."""
+    """Load a native binary (.so, ELF, PE, Mach-O...). Several binaries may be loaded at once; each
+    keeps its own analysis and edits. Returns immediately: the import is synchronous but Ghidra
+    auto-analysis runs in the background. Read exports/imports/strings/function list right away;
+    poll load_status() until {"state":"ready","analyzed":true} before decompiler-driven tools. With
+    analyze=False, analysis is skipped and started on demand the first time a decompiler tool is
+    called. The project (and analysis) is cached, so edits and analysis persist across sessions.
+    The loaded binary becomes the default for tools that omit their `binary` selector."""
+    global ACTIVE, _STARTED
     import pyghidra
     _home()
     path = os.path.abspath(path)
     if not os.path.isfile(path):
         raise FileNotFoundError(path)
-    with LOCK:
-        if S.get("state") == "analyzing":  # a previous load is still analyzing; don't disturb it
-            return _json(_status_locked())
-        if S.get("path") == path and S.get("state") == "ready":  # already loaded
-            if analyze and not S.get("analyzed"):
-                _kick_analysis_locked()
-            return _json(_status_locked())
-        pyghidra.start()
-        close_locked()
-        S["state"] = "importing"
-        from ghidra.program.util import GhidraProgramUtilities
-        from ghidra.app.decompiler import DecompInterface
-        prog, proj = _open_or_import(path)
-        already = not GhidraProgramUtilities.shouldAskToAnalyze(prog)
-        ifc = DecompInterface()
-        ifc.openProgram(prog)
-        S.update(prog=prog, ifc=ifc, proj=proj, path=path, state="ready", analyzed=already)
-        if analyze and not already:
-            _kick_analysis_locked()
-        return _json(_status_locked() | {"language": str(prog.getLanguageID()),
-                                         "image_base": str(prog.getImageBase())})
+    with REGISTRY_LOCK:
+        sess = SESSIONS.get(path)
+        if sess is not None:
+            with sess["lock"]:
+                if sess.get("state") in ("importing", "analyzing"):  # don't disturb a running load
+                    return _json(_status(sess))
+                if sess.get("state") == "ready":  # already loaded
+                    if analyze and not sess.get("analyzed"):
+                        _kick_analysis_locked(sess)
+                    ACTIVE = path
+                    return _json(_status(sess))
+                _dispose_session(sess)  # previous load errored; reimport
+                sess["state"] = "importing"
+        else:
+            sess = _new_session(path)
+            SESSIONS[path] = sess
+        ACTIVE = path
+    try:
+        with IMPORT_LOCK:  # Ghidra project open/import is not thread-safe
+            if not _STARTED:
+                pyghidra.start()
+                _STARTED = True
+            from ghidra.program.util import GhidraProgramUtilities
+            from ghidra.app.decompiler import DecompInterface
+            prog, proj = _open_or_import(path)
+            already = not GhidraProgramUtilities.shouldAskToAnalyze(prog)
+            ifc = DecompInterface()
+            ifc.openProgram(prog)
+        with sess["lock"]:
+            sess.update(prog=prog, ifc=ifc, proj=proj, name=prog.getName(), state="ready", analyzed=already)
+            if analyze and not already:
+                _kick_analysis_locked(sess)
+            return _json(_status(sess) | {"language": str(prog.getLanguageID()),
+                                          "image_base": str(prog.getImageBase())})
+    except Exception:
+        with REGISTRY_LOCK:
+            if SESSIONS.get(path) is sess:
+                SESSIONS.pop(path, None)
+                if ACTIVE == path:
+                    ACTIVE = next(reversed(SESSIONS), None)
+        raise
 
 
 @mcp.tool()
-def load_status() -> str:
-    """Current load state: idle / importing / analyzing / ready / error. The one signal to poll.
-    {"state":"ready","analyzed":true} means decompiler-driven tools are good to go; while
-    {"state":"analyzing",...} the structural tools (exports/imports/strings/function list) already work."""
-    with LOCK:
-        return _json(_status_locked())
+def load_status(binary: str = "") -> str:
+    """Current load state of one binary: idle / importing / analyzing / ready / error. The one signal
+    to poll. {"state":"ready","analyzed":true} means decompiler-driven tools are good to go; while
+    {"state":"analyzing",...} the structural tools (exports/imports/strings/function list) already work.
+    `binary` selects the loaded binary; omitted = the most recently loaded."""
+    with REGISTRY_LOCK:
+        if not SESSIONS:
+            return _json({"state": "idle"})
+    return _json(_status(_session(binary)))
 
 
 @mcp.tool()
-def list_functions(filter: str = "", limit: int = 50, offset: int = 0) -> str:
+def list_binaries() -> str:
+    """All loaded binaries with their id/path/name/state/analyzed/functions, plus which one is active
+    (the default when a tool omits `binary`). Use the id as the `binary` selector."""
+    with REGISTRY_LOCK:
+        return _json({"active": ACTIVE, "binaries": [_status(s) for s in SESSIONS.values()]})
+
+
+@mcp.tool()
+def unload_binary(binary: str = "") -> str:
+    """Unload one binary, freeing its program/project. Refused while it is still analyzing. The active
+    binary falls back to the most recently loaded remaining one. `binary` omitted = the active binary."""
+    global ACTIVE
+    sess = _session(binary)
+    with sess["lock"]:
+        if sess.get("state") == "analyzing":
+            raise RuntimeError("Still analyzing; poll load_status until ready before unloading.")
+        _dispose_session(sess)
+    with REGISTRY_LOCK:
+        SESSIONS.pop(sess["id"], None)
+        if ACTIVE == sess["id"]:
+            ACTIVE = next(reversed(SESSIONS), None)
+    return f"unloaded {sess['id']}"
+
+
+@mcp.tool()
+def list_functions(filter: str = "", limit: int = 50, offset: int = 0, binary: str = "") -> str:
     """List functions (name, address, signature). `filter` is a case-insensitive regex on the name.
     Available right after import; the list grows as background analysis discovers more functions."""
     m = _match(filter)
-    return _json(_page((_fn(f) for f in _prog().functionManager.getFunctions(True) if m(f.getName())), limit, offset))
+    p = _prog(binary)
+    return _json(_page((_fn(f) for f in p.functionManager.getFunctions(True) if m(f.getName())), limit, offset))
 
 
 @mcp.tool()
-def get_function(function: str, max_chars: int = 20000, timeout: int = 0) -> str:
+def get_function(function: str, max_chars: int = 20000, timeout: int = 0, binary: str = "") -> str:
     """Decompiled C of a function. `function` = exact name or any address inside it (e.g. 0x101234).
     Needs analysis: returns {"status":"analyzing"} until ready. `timeout` = per-call decompile seconds
     (0 = GHIDRA_MCP_DECOMPILE_TIMEOUT, default 30; pass 120 for the old limit)."""
-    busy = _require_analysis()
+    busy = _require_analysis(binary)
     if busy:
         return busy
-    res = _decompile(_func(function), timeout)
+    res = _decompile(_func(function, binary), timeout, binary)
     if res is None:
         return _json({"status": "timeout", "timeout_s": _dec_timeout(timeout), "function": function,
                       "hint": "raise the timeout param (e.g. timeout=120)"})
@@ -303,14 +398,14 @@ def get_function(function: str, max_chars: int = 20000, timeout: int = 0) -> str
 
 
 @mcp.tool()
-def get_disassembly(function: str, max_lines: int = 500) -> str:
+def get_disassembly(function: str, max_lines: int = 500, binary: str = "") -> str:
     """Assembly listing of a function (address, instruction, comments). Needs analysis: returns
     {"status":"analyzing"} until ready."""
-    busy = _require_analysis()
+    busy = _require_analysis(binary)
     if busy:
         return busy
-    p = _prog()
-    f = _func(function)
+    p = _prog(binary)
+    f = _func(function, binary)
     out = []
     for ins in p.listing.getInstructions(f.getBody(), True):
         out.append(f"{ins.getAddress()}  {ins}")
@@ -321,12 +416,13 @@ def get_disassembly(function: str, max_lines: int = 500) -> str:
 
 
 @mcp.tool()
-def list_strings(filter: str = "", limit: int = 50, offset: int = 0) -> str:
+def list_strings(filter: str = "", limit: int = 50, offset: int = 0, binary: str = "") -> str:
     """List defined strings (address, value). `filter` is a case-insensitive regex on the value.
     Available right after import; the set grows as background analysis defines more strings."""
     m = _match(filter)
+    p = _prog(binary)
     def gen():
-        for d in _prog().listing.getDefinedData(True):
+        for d in p.listing.getDefinedData(True):
             if d.hasStringValue():
                 v = str(d.getValue())
                 if m(v):
@@ -335,20 +431,21 @@ def list_strings(filter: str = "", limit: int = 50, offset: int = 0) -> str:
 
 
 @mcp.tool()
-def list_imports(filter: str = "", limit: int = 50, offset: int = 0) -> str:
+def list_imports(filter: str = "", limit: int = 50, offset: int = 0, binary: str = "") -> str:
     """List imported (external) symbols with their library. `filter` is a regex on the name.
     Available right after import (no analysis needed)."""
     m = _match(filter)
+    p = _prog(binary)
     gen = ({"name": s.getName(), "library": s.getParentNamespace().getName()}
-           for s in _prog().symbolTable.getExternalSymbols() if m(s.getName()))
+           for s in p.symbolTable.getExternalSymbols() if m(s.getName()))
     return _json(_page(gen, limit, offset))
 
 
 @mcp.tool()
-def list_exports(filter: str = "", limit: int = 50, offset: int = 0) -> str:
+def list_exports(filter: str = "", limit: int = 50, offset: int = 0, binary: str = "") -> str:
     """List exported symbols (entry points). `filter` is a regex on the name.
     Available right after import (no analysis needed)."""
-    st = _prog().symbolTable
+    st = _prog(binary).symbolTable
     m = _match(filter)
     def gen():
         for a in st.getExternalEntryPointIterator():
@@ -359,34 +456,34 @@ def list_exports(filter: str = "", limit: int = 50, offset: int = 0) -> str:
 
 
 @mcp.tool()
-def get_callers(function: str, limit: int = 50, offset: int = 0) -> str:
+def get_callers(function: str, limit: int = 50, offset: int = 0, binary: str = "") -> str:
     """Functions that call `function`. Needs analysis: returns {"status":"analyzing"} until ready."""
-    busy = _require_analysis()
+    busy = _require_analysis(binary)
     if busy:
         return busy
-    return _json(_page((_fn(f) for f in _func(function).getCallingFunctions(_monitor())), limit, offset))
+    return _json(_page((_fn(f) for f in _func(function, binary).getCallingFunctions(_monitor())), limit, offset))
 
 
 @mcp.tool()
-def get_callees(function: str, limit: int = 50, offset: int = 0) -> str:
+def get_callees(function: str, limit: int = 50, offset: int = 0, binary: str = "") -> str:
     """Functions called by `function`. Needs analysis: returns {"status":"analyzing"} until ready."""
-    busy = _require_analysis()
+    busy = _require_analysis(binary)
     if busy:
         return busy
-    return _json(_page((_fn(f) for f in _func(function).getCalledFunctions(_monitor())), limit, offset))
+    return _json(_page((_fn(f) for f in _func(function, binary).getCalledFunctions(_monitor())), limit, offset))
 
 
 @mcp.tool()
-def get_xrefs(target: str, limit: int = 50, offset: int = 0) -> str:
+def get_xrefs(target: str, limit: int = 50, offset: int = 0, binary: str = "") -> str:
     """References to an address, string, global or function. `target` = address or function name.
     Needs analysis: returns {"status":"analyzing"} until ready."""
-    busy = _require_analysis()
+    busy = _require_analysis(binary)
     if busy:
         return busy
-    p = _prog()
-    a = _addr(target)
+    p = _prog(binary)
+    a = _addr(target, binary)
     if a is None:
-        a = _func(target).getEntryPoint()
+        a = _func(target, binary).getEntryPoint()
     def gen():
         for r in p.referenceManager.getReferencesTo(a):
             f = p.functionManager.getFunctionContaining(r.getFromAddress())
@@ -395,32 +492,32 @@ def get_xrefs(target: str, limit: int = 50, offset: int = 0) -> str:
 
 
 @mcp.tool()
-def rename(target: str, new_name: str) -> str:
+def rename(target: str, new_name: str, binary: str = "") -> str:
     """Rename a function (by name/address) or, for a non-function address, create/replace its label.
     Do this often: good names are the most valuable output for the next analyst.
     Needs analysis (edits the program): returns {"status":"analyzing"} until ready."""
-    busy = _require_analysis()
+    busy = _require_analysis(binary)
     if busy:
         return busy
     from ghidra.program.model.symbol import SourceType
-    p = _prog()
+    p = _prog(binary)
     try:
-        f = _func(target)
+        f = _func(target, binary)
         old = f.getName()
-        _edit("rename", lambda: f.setName(new_name, SourceType.USER_DEFINED))
+        _edit("rename", lambda: f.setName(new_name, SourceType.USER_DEFINED), binary)
         return f"{old} -> {new_name} @ {f.getEntryPoint()}"
     except ValueError:
-        a = _addr(target)
+        a = _addr(target, binary)
         if a is None:
             raise
-        _edit("rename", lambda: p.symbolTable.createLabel(a, new_name, SourceType.USER_DEFINED).setPrimary())
+        _edit("rename", lambda: p.symbolTable.createLabel(a, new_name, SourceType.USER_DEFINED).setPrimary(), binary)
         return f"{a} -> {new_name}"
 
 
-def _var(function, name):
+def _var(function, name, binary=""):
     """(function, high symbol) for a variable as named in the decompiled C."""
-    f = _func(function)
-    res = _decompile(f)
+    f = _func(function, binary)
+    res = _decompile(f, binary=binary)
     if res is None:
         raise RuntimeError(f"Decompilation of {f.getName()} timed out; raise GHIDRA_MCP_DECOMPILE_TIMEOUT")
     syms = list(res.getHighFunction().getLocalSymbolMap().getSymbols())
@@ -431,74 +528,74 @@ def _var(function, name):
 
 
 @mcp.tool()
-def rename_variable(function: str, old_name: str, new_name: str) -> str:
+def rename_variable(function: str, old_name: str, new_name: str, binary: str = "") -> str:
     """Rename a local variable or parameter as shown in the decompiled C of `function`.
     Needs analysis: returns {"status":"analyzing"} until ready."""
-    busy = _require_analysis()
+    busy = _require_analysis(binary)
     if busy:
         return busy
     from ghidra.program.model.pcode import HighFunctionDBUtil
     from ghidra.program.model.symbol import SourceType
-    f, sym = _var(function, old_name)
-    _edit("rename variable", lambda: HighFunctionDBUtil.updateDBVariable(sym, new_name, None, SourceType.USER_DEFINED))
+    f, sym = _var(function, old_name, binary)
+    _edit("rename variable", lambda: HighFunctionDBUtil.updateDBVariable(sym, new_name, None, SourceType.USER_DEFINED), binary)
     return f"{old_name} -> {new_name} in {f.getName()}"
 
 
 @mcp.tool()
-def retype_variable(function: str, variable: str, type: str) -> str:
+def retype_variable(function: str, variable: str, type: str, binary: str = "") -> str:
     """Change the type of a local/parameter as shown in the decompiled C, e.g. type='char *' or 'uint8_t[16]'.
     Needs analysis: returns {"status":"analyzing"} until ready."""
-    busy = _require_analysis()
+    busy = _require_analysis(binary)
     if busy:
         return busy
     from ghidra.util.data import DataTypeParser
     from ghidra.program.model.pcode import HighFunctionDBUtil
     from ghidra.program.model.symbol import SourceType
-    f, sym = _var(function, variable)
-    dtm = _prog().getDataTypeManager()
+    f, sym = _var(function, variable, binary)
+    dtm = _prog(binary).getDataTypeManager()
     dt = DataTypeParser(dtm, dtm, None, DataTypeParser.AllowedDataTypes.ALL).parse(type)
-    _edit("retype variable", lambda: HighFunctionDBUtil.updateDBVariable(sym, None, dt, SourceType.USER_DEFINED))
+    _edit("retype variable", lambda: HighFunctionDBUtil.updateDBVariable(sym, None, dt, SourceType.USER_DEFINED), binary)
     return f"{variable}: {dt.getName()} in {f.getName()}"
 
 
 @mcp.tool()
-def set_signature(function: str, signature: str) -> str:
+def set_signature(function: str, signature: str, binary: str = "") -> str:
     """Apply a C prototype to a function, e.g. 'int check_license(char *key, int len)'.
     Fixes return type, parameter names/types and count in the decompiled output.
     Needs analysis: returns {"status":"analyzing"} until ready."""
-    busy = _require_analysis()
+    busy = _require_analysis(binary)
     if busy:
         return busy
     from ghidra.app.cmd.function import ApplyFunctionSignatureCmd
     from ghidra.app.util.parser import FunctionSignatureParser
     from ghidra.program.model.symbol import SourceType
-    p = _prog()
-    f = _func(function)
+    p = _prog(binary)
+    f = _func(function, binary)
     fd = FunctionSignatureParser(p.getDataTypeManager(), None).parse(f.getSignature(), signature)
     cmd = ApplyFunctionSignatureCmd(f.getEntryPoint(), fd, SourceType.USER_DEFINED)
-    if not _edit("set signature", lambda: cmd.applyTo(p)):
+    if not _edit("set signature", lambda: cmd.applyTo(p), binary):
         raise RuntimeError(f"Could not apply signature: {cmd.getStatusMsg()}")
     return f"{f.getName()}: {f.getPrototypeString(False, False)}"
 
 
 @mcp.tool()
-def read_memory(address: str, length: int = 64) -> str:
+def read_memory(address: str, length: int = 64, binary: str = "") -> str:
     """Hex dump of `length` bytes (max 4096) at an address, e.g. to read a string table or JNI method table.
     Available right after import (raw memory, no analysis needed)."""
-    a = _addr(address)
+    a = _addr(address, binary)
     if a is None:
         raise ValueError(f"Bad address '{address}'")
     length = min(length, 4096)
     from jpype import JArray, JByte
     buf = JArray(JByte)(length)
-    n = _prog().memory.getBytes(a, buf)
+    n = _prog(binary).memory.getBytes(a, buf)
     data = bytes(b & 0xFF for b in buf[:n])
     length = n
     return "\n".join(f"{a.add(i)}  {data[i:i + 16].hex(' ')}" for i in range(0, length, 16))
 
 
 @mcp.tool()
-def search_bytes(pattern: str, limit: int = 50, offset: int = 0) -> str:
+def search_bytes(pattern: str, limit: int = 50, offset: int = 0, binary: str = "") -> str:
     """Find a byte pattern in memory. Hex with '??' wildcards, e.g. '48 8b ?? 05' or 'deadbeef'.
     Available right after import (raw memory scan, no analysis needed)."""
     toks = re.findall(r"\?\?|[0-9a-fA-F]{2}", pattern)
@@ -506,7 +603,7 @@ def search_bytes(pattern: str, limit: int = 50, offset: int = 0) -> str:
         raise ValueError("pattern must be hex bytes, optionally with ?? wildcards")
     val = bytes(0 if t == "??" else int(t, 16) for t in toks)
     mask = bytes(0 if t == "??" else 0xFF for t in toks)
-    p = _prog()
+    p = _prog(binary)
     def gen():
         a = p.minAddress
         while a is not None:
@@ -520,15 +617,15 @@ def search_bytes(pattern: str, limit: int = 50, offset: int = 0) -> str:
 
 
 @mcp.tool()
-def search_constants(value: str, limit: int = 50, offset: int = 0) -> str:
+def search_constants(value: str, limit: int = 50, offset: int = 0, binary: str = "") -> str:
     """Find instructions with a scalar operand equal to `value` (decimal or 0x hex): crypto constants,
     magic numbers, flags. Needs analysis (iterates instructions): returns {"status":"analyzing"} until ready."""
-    busy = _require_analysis()
+    busy = _require_analysis(binary)
     if busy:
         return busy
     from ghidra.program.model.scalar import Scalar
     v = int(value, 0)
-    p = _prog()
+    p = _prog(binary)
     def gen():
         for ins in p.listing.getInstructions(True):
             for i in range(ins.getNumOperands()):
@@ -540,13 +637,13 @@ def search_constants(value: str, limit: int = 50, offset: int = 0) -> str:
 
 
 @mcp.tool()
-def call_path(source: str, target: str, max_depth: int = 10) -> str:
+def call_path(source: str, target: str, max_depth: int = 10, binary: str = "") -> str:
     """Shortest call chain from function `source` to `target` (e.g. JNI_OnLoad -> some_sink), or null if none.
     Needs analysis: returns {"status":"analyzing"} until ready."""
-    busy = _require_analysis()
+    busy = _require_analysis(binary)
     if busy:
         return busy
-    s, t = _func(source), _func(target)
+    s, t = _func(source, binary), _func(target, binary)
     prev = {s.getEntryPoint(): None}
     frontier = [s]
     for _ in range(max_depth):
@@ -569,35 +666,37 @@ def call_path(source: str, target: str, max_depth: int = 10) -> str:
 
 
 @mcp.tool()
-def add_comment(target: str, text: str, kind: str = "pre") -> str:
+def add_comment(target: str, text: str, kind: str = "pre", binary: str = "") -> str:
     """Add a comment at an address or function entry. kind: pre (default, shown above the line in the
     decompiler), eol, post, plate, repeatable. Empty text clears it. Use liberally to document findings.
     Needs analysis (edits the program): returns {"status":"analyzing"} until ready."""
-    busy = _require_analysis()
+    busy = _require_analysis(binary)
     if busy:
         return busy
     from ghidra.program.model.listing import CodeUnit
     if kind not in COMMENTS:
         raise ValueError(f"kind must be one of {COMMENTS}")
-    a = _addr(target)
+    a = _addr(target, binary)
     if a is None:
-        a = _func(target).getEntryPoint()
+        a = _func(target, binary).getEntryPoint()
     ct = getattr(CodeUnit, kind.upper() + "_COMMENT")
-    _edit("comment", lambda: _prog().listing.setComment(a, ct, text or None))
+    _edit("comment", lambda: _prog(binary).listing.setComment(a, ct, text or None), binary)
     return f"{kind} comment set at {a}"
 
 
-def close_locked():
-    """Dispose the current program/project. Caller holds LOCK. Never called while analyzing."""
-    if "proj" in S:
-        S["ifc"].dispose()
-        S["proj"].close()
-    S.clear()
-
-
 def close():
-    with LOCK:
-        close_locked()
+    """Dispose every loaded program/project (skips ones still analyzing)."""
+    global ACTIVE
+    with REGISTRY_LOCK:
+        sessions = list(SESSIONS.values())
+    for sess in sessions:
+        with sess["lock"]:
+            if sess.get("state") != "analyzing":
+                _dispose_session(sess)
+        with REGISTRY_LOCK:
+            SESSIONS.pop(sess["id"], None)
+    with REGISTRY_LOCK:
+        ACTIVE = None
 
 
 def main():

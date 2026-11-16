@@ -20,6 +20,14 @@ async def main(binary, fn, binary2=None, fn2=None):
             return t
         import json
         ld = json.loads(await call("load_binary", path=binary))
+        assert ld.get("state") in ("importing", "analyzing", "ready"), ld
+        # import is asynchronous now: poll until the program exists before structural queries
+        for _ in range(600):
+            if ld.get("state") != "importing":
+                break
+            await asyncio.sleep(1)
+            ld = json.loads(await call("load_status"))
+        assert ld.get("state") != "error", ld
         # structural tools must work while analysis is still running in the background
         if ld.get("state") == "analyzing":
             assert "items" in json.loads(await call("list_exports")), "exports should work during analyzing"
@@ -36,6 +44,7 @@ async def main(binary, fn, binary2=None, fn2=None):
             await asyncio.sleep(1)
         else:
             raise AssertionError("analysis did not finish in 600s")
+        assert st.get("language") and st.get("image_base"), st
         await call("list_functions", filter=fn)
         await call("get_function", function=fn)
         if fn != "renamed_fn":

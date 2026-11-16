@@ -51,8 +51,8 @@ Tell the model to rename and comment as it goes; the notes are what the next ana
 
 | Tool | Description |
 |------|-------------|
-| `load_binary` | Import a binary (ELF/.so, PE, Mach-O...) and start auto-analysis **in the background**. **Call first.** Returns immediately. Cached per file. `analyze=False` skips analysis (started on demand). Several binaries may be loaded at once. |
-| `load_status` | Load state: `idle`/`importing`/`analyzing`/`ready`/`error`. Poll until `{"state":"ready","analyzed":true}`. |
+| `load_binary` | Import a binary (ELF/.so, PE, Mach-O...) and start auto-analysis **in the background**. **Call first.** Returns immediately with `state="importing"`; repeated calls are idempotent. Cached per file. `analyze=False` skips analysis (started on demand). After an error, pass `retry=True` to re-import. Several binaries may be loaded at once. |
+| `load_status` | Load state: `idle`/`importing`/`analyzing`/`ready`/`error`, plus `name`/`functions`/`language`/`image_base` once imported. Poll until `{"state":"ready","analyzed":true}`. Never restarts a job. |
 | `list_binaries` | All loaded binaries (id/path/name/state/analyzed/functions) and which one is active. |
 | `unload_binary` | Free one loaded binary (refused while it is still analyzing). |
 | `list_functions` | Functions (name, `address` = Ghidra address, `file_address` = ELF p_vaddr, signature); `filter` = regex. Paginated. Works right after import. |
@@ -97,14 +97,17 @@ unload_binary(binary="liba.so")
 
 ## Load flow (non-blocking)
 
-`load_binary` no longer blocks on Ghidra's multi-minute auto-analysis. The import is synchronous (seconds);
-full analysis then runs on a background thread. The intended agent flow:
+`load_binary` no longer blocks on either the import or Ghidra's multi-minute auto-analysis: both run on a
+background thread that keeps running after the call returns. The intended agent flow:
 
-1. `load_binary(path)` — returns at once with `{"state":"analyzing"|"ready", ...}`.
-2. Read **immediately**, while analysis runs: `list_exports`, `list_imports`, `list_strings`, `list_functions`,
+1. `load_binary(path)` — returns at once with `{"state":"importing", ...}`. Calling it again for the same
+   path is idempotent: it returns the current status and never restarts a live job. If a previous load
+   ended in `error`, pass `retry=True` to discard it and import again.
+2. Poll `load_status()` until `state` is no longer `importing`.
+3. Read **immediately**, while analysis runs: `list_exports`, `list_imports`, `list_strings`, `list_functions`,
    `read_memory`, `search_bytes` — the structural questions (which exports? JNI functions? suspicious imports/strings?).
-3. Poll `load_status()` until `{"state":"ready","analyzed":true}`.
-4. Then call decompiler-driven tools: `get_function`, `get_disassembly`, `get_callers`/`get_callees`/`get_xrefs`,
+4. Poll `load_status()` until `{"state":"ready","analyzed":true}`.
+5. Then call decompiler-driven tools: `get_function`, `get_disassembly`, `get_callers`/`get_callees`/`get_xrefs`,
    `call_path`, `search_constants`, `rename*`, `retype_variable`, `set_signature`, `add_comment`.
 
 Called before analysis is done, a decompiler-driven tool returns a soft

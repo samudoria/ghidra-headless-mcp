@@ -4,7 +4,7 @@ Covers the non-blocking load logic: state transitions, the soft "analyzing" gati
 decompiler-driven tools, on-demand analysis for analyze=False, cached-analyzed -> ready,
 the decompiler-timeout signal, and multi-binary sessions (selector resolution, isolation,
 parallel analysis, unloading). The Java-touching paths are covered by tests/smoke.py."""
-import json, os, sys, time
+import json, os, sys, tempfile, threading, time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import ghidra_mcp.server as srv
@@ -20,6 +20,10 @@ class FakeProg:
         self._name = name
     def getName(self):
         return self._name
+    def getLanguageID(self):
+        return "x86:LE:64:default"
+    def getImageBase(self):
+        return "0x100000"
     functionManager = FakeFM()
 
 
@@ -219,14 +223,123 @@ def test_unload():
     assert srv.ACTIVE == a["id"]
     assert srv._session() is a
     assert "prog" not in b and "proj" not in b
-    # refuse to unload while analyzing
+    # refuse to unload while a job is actually running
     c = add("/z/libc.so", name="libc.so", state="analyzing")
+    c["thread"] = threading.Thread(target=lambda: time.sleep(1), daemon=True)
+    c["thread"].start()
     try:
         srv.unload_binary(c["id"])
         assert False, "expected RuntimeError while analyzing"
     except RuntimeError as e:
-        assert "Still analyzing" in str(e)
-    print("ok: unload frees a session, active falls back, refuses while analyzing")
+        assert "Still loading/analyzing" in str(e)
+    c["thread"].join(2)
+    print("ok: unload frees a session, active falls back, refuses while a job runs")
+
+
+def _tmpfile():
+    os.environ.setdefault("GHIDRA_INSTALL_DIR", "/tmp/ghidra")
+    fd, path = tempfile.mkstemp(suffix=".so")
+    os.close(fd)
+    return path
+
+
+def test_page_pagination():
+    r = srv._page(iter(range(100)), 10, 0)
+    assert len(r["items"]) == 10 and r["offset"] == 0 and r["next_offset"] == 10, r
+    r = srv._page(iter(range(5)), 10, 0)
+    assert r["items"] == list(range(5)) and r["next_offset"] is None, r
+    r = srv._page(iter(range(100)), 10, 95)
+    assert r["items"] == [95, 96, 97, 98, 99] and r["next_offset"] is None, r
+    print("ok: pagination limit/offset/next_offset")
+
+
+def test_load_status_does_not_restart():
+    reset()
+    sess = add("/x/libfake.so", state="ready", analyzed=False)
+    srv.load_status()  # must not kick analysis for a ready-but-unanalyzed session
+    assert "thread" not in sess and sess["state"] == "ready"
+    sentinel = object()
+    sess.update(state="analyzing", analyze_start=time.time(), thread=sentinel)
+    srv.load_status()
+    assert sess["thread"] is sentinel  # load_status only reads
+    print("ok: load_status never restarts analysis")
+
+
+def test_load_binary_background_idempotent():
+    reset()
+    path = _tmpfile()
+    calls = {"n": 0}
+    started, release = threading.Event(), threading.Event()
+    orig = srv._import_thread
+
+    def fake_import(sess, analyze):
+        calls["n"] += 1
+        started.set()
+        release.wait(5)
+        with sess["lock"]:
+            sess.update(state="ready", analyzed=True)
+
+    srv._import_thread = fake_import
+    try:
+        d = json.loads(srv.load_binary(path))
+        assert d["state"] == "importing", d  # returns before the import finishes
+        assert started.wait(2)
+        d = json.loads(srv.load_binary(path))  # repeat while job alive
+        assert d["state"] == "importing" and calls["n"] == 1, (d, calls)
+        release.set()
+        srv.SESSIONS[path]["thread"].join(2)
+        assert json.loads(srv.load_status())["state"] == "ready"
+    finally:
+        srv._import_thread = orig
+        os.remove(path)
+    print("ok: load_binary is async + idempotent; job survives the call")
+
+
+def test_load_binary_error_idempotent():
+    reset()
+    path = _tmpfile()
+    calls = {"n": 0}
+    orig = srv._import_thread
+
+    def fake_import(sess, analyze):
+        calls["n"] += 1
+        time.sleep(0.1)  # keep the job in "importing" until the caller observes it
+        with sess["lock"]:
+            sess.update(state="error", analyze_err="boom")
+
+    srv._import_thread = fake_import
+    try:
+        srv.load_binary(path)
+        srv.SESSIONS[path]["thread"].join(2)
+        d = json.loads(srv.load_binary(path))  # no retry -> no re-import
+        assert d["state"] == "error" and d["error"] == "boom" and calls["n"] == 1, (d, calls)
+        d = json.loads(srv.load_binary(path, retry=True))  # explicit retry
+        assert d["state"] == "importing" and calls["n"] == 2, (d, calls)
+        srv.SESSIONS[path]["thread"].join(2)
+    finally:
+        srv._import_thread = orig
+        os.remove(path)
+    print("ok: error state is idempotent; retry=True re-imports")
+
+
+def test_stale_job_recovery():
+    reset()
+    path = _tmpfile()
+    sess = srv._new_session(path)
+    sess.update(name="libfake.so", prog=FakeProg(), proj=FakeProj(), ifc=FakeIfc(),
+                state="analyzing", analyzed=False)  # thread is missing -> stale
+    srv.SESSIONS[path] = sess
+    srv.ACTIVE = path
+    srv._analyze = lambda prog, proj: time.sleep(0.1)
+    try:
+        d = json.loads(srv.load_binary(path))
+        assert d["state"] == "analyzing", d
+        assert sess["thread"].is_alive()
+        sess["thread"].join(2)
+        assert sess["state"] == "ready" and sess["analyzed"] is True
+    finally:
+        os.remove(path)
+    print("ok: stale analysis job is restarted by load_binary")
 
 
 def demo():
@@ -240,6 +353,11 @@ def demo():
     test_multi_session_isolation()
     test_parallel_analysis()
     test_unload()
+    test_page_pagination()
+    test_load_status_does_not_restart()
+    test_load_binary_background_idempotent()
+    test_load_binary_error_idempotent()
+    test_stale_job_recovery()
     print("\nall state tests passed")
 
 

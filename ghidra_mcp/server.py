@@ -1,12 +1,12 @@
 """Headless Ghidra MCP server (stdio). Several binaries can be loaded at once; edits are saved immediately.
 
-Load is non-blocking: load_binary imports the program (fast) and runs Ghidra auto-analysis on a
-background thread. Imports are serialized (Ghidra project code is not thread-safe); analysis and
-queries run in parallel across binaries. Structural tools (exports/imports/strings/function
-list/memory) answer right after import; decompiler-driven tools return a soft {"status":"analyzing"}
-until analysis is done. Poll load_status() for the ready signal. Every tool takes an optional
+Load is non-blocking: load_binary starts the import and Ghidra auto-analysis on background
+threads and returns at once. Imports are serialized (Ghidra project code is not thread-safe);
+analysis and queries run in parallel across binaries. Structural tools (exports/imports/strings/
+function list/memory) answer once the import is done; decompiler-driven tools return a soft
+{"status":"analyzing"} until analysis is done. Poll load_status() for the ready signal. Every tool takes an optional
 `binary` selector (path, basename or program name); omitted = most recently loaded. See PLAN.md."""
-import hashlib, json, os, re, sys, threading, time
+import hashlib, json, os, re, sys, threading, time, traceback
 
 # JVM/Ghidra write to fd 1; keep it for MCP only and send everything else to stderr.
 _proto = os.fdopen(os.dup(1), "w")
@@ -247,6 +247,8 @@ def _status(sess):
             p = sess["prog"]
             d["name"] = p.getName()
             d["functions"] = p.functionManager.getFunctionCount()
+            d["language"] = str(p.getLanguageID())
+            d["image_base"] = str(p.getImageBase())
         if st == "analyzing":
             d["elapsed_s"] = round(time.time() - sess.get("analyze_start", time.time()), 1)
         if st == "ready":
@@ -288,25 +290,67 @@ def _analyze(prog, proj):
 
 
 def _analysis_thread(sess):
-    prog, proj = sess["prog"], sess["proj"]
+    prog = None
     try:
+        prog, proj = sess["prog"], sess["proj"]
         _analyze(prog, proj)
         with sess["lock"]:
             if sess.get("prog") is prog:
                 sess.update(state="ready", analyzed=True, analyze_end=time.time())
     except Exception as e:  # analysis failure surfaces via load_status / tool error
+        traceback.print_exc()
         with sess["lock"]:
-            if sess.get("prog") is prog:
+            if prog is None or sess.get("prog") is prog:
                 sess.update(state="error", analyze_err=str(e))
 
 
 def _kick_analysis_locked(sess):
     """Start background analysis of a session. Caller holds sess["lock"]; program imported, not analyzed."""
+    t = sess.get("thread")
+    if t is not None and t.is_alive() and t is not threading.current_thread():
+        return  # a job is already running; never start a second one
     sess.update(state="analyzing", analyze_start=time.time())
     sess.pop("analyze_err", None)
     t = threading.Thread(target=_analysis_thread, args=(sess,), daemon=True)
     sess["thread"] = t
     t.start()
+
+
+def _import_thread(sess, analyze):
+    """Background import + optional analysis. Runs independently of the MCP request, so a slow
+    import never blocks the client (which would time out and close the stdio stream)."""
+    global _STARTED
+    path = sess["path"]
+    prog = proj = ifc = None
+    try:
+        import pyghidra
+        with IMPORT_LOCK:  # Ghidra project open/import is not thread-safe
+            if not _STARTED:
+                pyghidra.start()
+                _STARTED = True
+            from ghidra.program.util import GhidraProgramUtilities
+            from ghidra.app.decompiler import DecompInterface
+            prog, proj = _open_or_import(path)
+            already = not GhidraProgramUtilities.shouldAskToAnalyze(prog)
+            ifc = DecompInterface()
+            ifc.openProgram(prog)
+        with sess["lock"]:
+            if SESSIONS.get(path) is not sess:  # unloaded while importing
+                try:
+                    ifc.dispose()
+                    proj.close()
+                except Exception:
+                    pass
+                return
+            sess.update(prog=prog, ifc=ifc, proj=proj, name=prog.getName(),
+                        state="ready", analyzed=already)
+            if analyze and not already:
+                _kick_analysis_locked(sess)
+    except Exception as e:  # import failure surfaces via load_status; session is kept (idempotent)
+        traceback.print_exc()
+        with sess["lock"]:
+            if SESSIONS.get(path) is sess:
+                sess.update(state="error", analyze_err=str(e))
 
 
 def _require_analysis(binary=""):
@@ -352,7 +396,7 @@ def _open_or_import(path):
 
 
 def _dispose_session(sess):
-    """Dispose the session's program/project. Caller holds sess["lock"] and it is not analyzing."""
+    """Dispose the session's program/project. Caller holds sess["lock"] and no job is running."""
     if "ifc" in sess:
         sess["ifc"].dispose()
     if "proj" in sess:
@@ -362,16 +406,19 @@ def _dispose_session(sess):
 
 
 @mcp.tool()
-def load_binary(path: str, analyze: bool = True) -> str:
+def load_binary(path: str, analyze: bool = True, retry: bool = False) -> str:
     """Load a native binary (.so, ELF, PE, Mach-O...). Several binaries may be loaded at once; each
-    keeps its own analysis and edits. Returns immediately: the import is synchronous but Ghidra
-    auto-analysis runs in the background. Read exports/imports/strings/function list right away;
-    poll load_status() until {"state":"ready","analyzed":true} before decompiler-driven tools. With
-    analyze=False, analysis is skipped and started on demand the first time a decompiler tool is
-    called. The project (and analysis) is cached, so edits and analysis persist across sessions.
-    The loaded binary becomes the default for tools that omit their `binary` selector."""
-    global ACTIVE, _STARTED
-    import pyghidra
+    keeps its own analysis and edits. Returns immediately with state "importing": both the import
+    and Ghidra auto-analysis run on a background thread, which keeps running even if this call
+    returns. Poll load_status() until {"state":"ready","analyzed":true} before decompiler-driven
+    tools; exports/imports/strings/function list work once state is "ready". Calling this again for
+    the same path is idempotent: it never re-imports or restarts a running job (a dead job is
+    restarted automatically). With analyze=False, analysis is skipped and started on demand the
+    first time a decompiler tool is called. On a previous failure the session stays in state
+    "error"; pass retry=True to discard it and import again. The project (and analysis) is cached,
+    so edits and analysis persist across sessions. The loaded binary becomes the default for tools
+    that omit their `binary` selector."""
+    global ACTIVE
     _home()
     path = os.path.abspath(path)
     if not os.path.isfile(path):
@@ -380,43 +427,38 @@ def load_binary(path: str, analyze: bool = True) -> str:
         sess = SESSIONS.get(path)
         if sess is not None:
             with sess["lock"]:
-                if sess.get("state") in ("importing", "analyzing"):  # don't disturb a running load
-                    return _json(_status(sess))
-                if sess.get("state") == "ready":  # already loaded
+                st = sess.get("state", "idle")
+                if st in ("importing", "analyzing"):
+                    t = sess.get("thread")
+                    if t is not None and t.is_alive():  # job alive: never disturb it
+                        ACTIVE = path
+                        return _json(_status(sess))
+                    if st == "analyzing" and "prog" in sess:  # stale analysis: restart analysis only
+                        sess.pop("thread", None)
+                        _kick_analysis_locked(sess)
+                        ACTIVE = path
+                        return _json(_status(sess))
+                    # stale import: fall through and restart the import job
+                elif st == "ready":  # already loaded
                     if analyze and not sess.get("analyzed"):
                         _kick_analysis_locked(sess)
                     ACTIVE = path
                     return _json(_status(sess))
-                _dispose_session(sess)  # previous load errored; reimport
+                elif st == "error" and not retry:
+                    ACTIVE = path
+                    return _json(_status(sess))
+                _dispose_session(sess)  # retry after error, or restart a dead import
                 sess["state"] = "importing"
         else:
             sess = _new_session(path)
             SESSIONS[path] = sess
         ACTIVE = path
-    try:
-        with IMPORT_LOCK:  # Ghidra project open/import is not thread-safe
-            if not _STARTED:
-                pyghidra.start()
-                _STARTED = True
-            from ghidra.program.util import GhidraProgramUtilities
-            from ghidra.app.decompiler import DecompInterface
-            prog, proj = _open_or_import(path)
-            already = not GhidraProgramUtilities.shouldAskToAnalyze(prog)
-            ifc = DecompInterface()
-            ifc.openProgram(prog)
-        with sess["lock"]:
-            sess.update(prog=prog, ifc=ifc, proj=proj, name=prog.getName(), state="ready", analyzed=already)
-            if analyze and not already:
-                _kick_analysis_locked(sess)
-            return _json(_status(sess) | {"language": str(prog.getLanguageID()),
-                                          "image_base": str(prog.getImageBase())})
-    except Exception:
-        with REGISTRY_LOCK:
-            if SESSIONS.get(path) is sess:
-                SESSIONS.pop(path, None)
-                if ACTIVE == path:
-                    ACTIVE = next(reversed(SESSIONS), None)
-        raise
+        sess.update(state="importing", analyze_requested=bool(analyze))
+        sess.pop("analyze_err", None)
+        t = threading.Thread(target=_import_thread, args=(sess, analyze), daemon=True)
+        sess["thread"] = t
+        t.start()
+        return _json(_status(sess))
 
 
 @mcp.tool()
@@ -441,13 +483,15 @@ def list_binaries() -> str:
 
 @mcp.tool()
 def unload_binary(binary: str = "") -> str:
-    """Unload one binary, freeing its program/project. Refused while it is still analyzing. The active
-    binary falls back to the most recently loaded remaining one. `binary` omitted = the active binary."""
+    """Unload one binary, freeing its program/project. Refused while it is still importing or
+    analyzing. The active binary falls back to the most recently loaded remaining one. `binary`
+    omitted = the active binary."""
     global ACTIVE
     sess = _session(binary)
     with sess["lock"]:
-        if sess.get("state") == "analyzing":
-            raise RuntimeError("Still analyzing; poll load_status until ready before unloading.")
+        t = sess.get("thread")
+        if sess.get("state") in ("importing", "analyzing") and t is not None and t.is_alive():
+            raise RuntimeError("Still loading/analyzing; poll load_status until ready before unloading.")
         _dispose_session(sess)
     with REGISTRY_LOCK:
         SESSIONS.pop(sess["id"], None)
@@ -793,13 +837,14 @@ def add_comment(target: str, text: str, kind: str = "pre", binary: str = "") -> 
 
 
 def close():
-    """Dispose every loaded program/project (skips ones still analyzing)."""
+    """Dispose every loaded program/project (skips ones still importing/analyzing)."""
     global ACTIVE
     with REGISTRY_LOCK:
         sessions = list(SESSIONS.values())
     for sess in sessions:
         with sess["lock"]:
-            if sess.get("state") != "analyzing":
+            t = sess.get("thread")
+            if sess.get("state") not in ("importing", "analyzing") or t is None or not t.is_alive():
                 _dispose_session(sess)
         with REGISTRY_LOCK:
             SESSIONS.pop(sess["id"], None)

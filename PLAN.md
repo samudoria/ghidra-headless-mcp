@@ -40,17 +40,23 @@ idle --load_binary--> importing --(import done)--> ready
   raise with the candidate ids; empty = `ACTIVE`.
 - `unload_binary` refuses while that session is analyzing (disposing mid-analysis is unsafe).
 
-`load_binary(path, analyze=True)`:
-1. `pyghidra.start()`, open/create cached project, import program (or open cached),
-   open `DecompInterface` — all synchronous. State → `importing`, then `ready`.
-2. If `analyze` and program not already analyzed → spawn **background thread** running
-   `analyzeAll + markProgramAnalyzed + proj.save`, state → `analyzing`, **return now**.
+`load_binary(path, analyze=True, retry=False)`:
+1. Register the session and set state → `importing`, then spawn a **background import thread**
+   and return immediately. The thread calls `pyghidra.start()`, opens/creates the cached
+   project, imports the program (or opens the cached one) and opens `DecompInterface`.
+   On success state → `ready`; on failure state → `error` (the session is kept).
+2. If `analyze` and program not already analyzed → the import thread spawns a second
+   **background thread** running `analyzeAll + markProgramAnalyzed + proj.save`,
+   state → `analyzing`.
 3. If the cached project is already analyzed → straight to `ready` (analyzed), no thread.
-Returns `{"state","name","functions","language","image_base","analyzed"}` (superset of
-the old shape — only added fields).
+Returns `{"id","state",...}` immediately; once imported, `load_status` adds
+`name`/`functions`/`language`/`image_base`.
 
 Re-entrancy: a second `load_binary` for a path that is already `importing`/`analyzing` returns
-that session's status and does not disturb the running work. Imports for different paths are
+that session's status and does not disturb the running work. If the tracked job thread is dead
+(stale), `load_binary` restarts it (analysis only when the program is already imported, otherwise
+the import). A session in `error` stays there; `retry=True` disposes it and imports again.
+`load_status` is strictly read-only and never restarts anything. Imports for different paths are
 serialized by `IMPORT_LOCK`; their analyses then run in parallel.
 
 ### Per-tool needs-analysis classification
@@ -95,10 +101,12 @@ analysis-in-progress (more symbols appearing) — acceptable, documented ceiling
 - Each session has its own `RLock` guarding that session's state, prog/ifc/proj refs and edits.
 - `IMPORT_LOCK` serializes `pyghidra.start` and project open/import across sessions.
 - Lock order: `REGISTRY_LOCK` → `IMPORT_LOCK` → session lock (never reverse).
+- The background import thread holds `IMPORT_LOCK` for the import, then takes the session lock
+  briefly to publish `prog/ifc/proj` and flip `importing→ready`/`→error`.
 - The background analysis thread runs `analyzeAll` **without** holding its session lock (it would
   block everything for minutes); it takes the lock only briefly to flip `analyzing→ready`/`→error`,
   and only if it is still the current program for that session.
-- Invariant: at most one analysis thread per session; a session's `prog` does not change while it is
+- Invariant: at most one import/analysis job per session; a session's `prog` does not change while it is
   analyzing. Different sessions analyze concurrently.
 
 ### Phase 3

@@ -55,8 +55,9 @@ Tell the model to rename and comment as it goes; the notes are what the next ana
 | `load_status` | Load state: `idle`/`importing`/`analyzing`/`ready`/`error`. Poll until `{"state":"ready","analyzed":true}`. |
 | `list_binaries` | All loaded binaries (id/path/name/state/analyzed/functions) and which one is active. |
 | `unload_binary` | Free one loaded binary (refused while it is still analyzing). |
-| `list_functions` | Functions (name, address, signature); `filter` = regex. Paginated. Works right after import. |
-| `get_function` | Decompiled C (`function` = name or any address inside). |
+| `list_functions` | Functions (name, `address` = Ghidra address, `file_address` = ELF p_vaddr, signature); `filter` = regex. Paginated. Works right after import. |
+| `resolve_symbol` | Resolve a name/address to `{name, address, file_address, signature}`. Use `file_address` when the address must match readelf/angr/a hex editor. |
+| `get_function` | Decompiled C (`function` = name or any address inside, including a file-relative address). |
 | `get_disassembly` | Assembly listing of a function. |
 | `list_strings` / `list_imports` / `list_exports` | Paginated, `filter` = regex. |
 | `get_callers` / `get_callees` | Call graph neighbours of a function. |

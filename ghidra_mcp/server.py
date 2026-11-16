@@ -87,9 +87,86 @@ def _match(filter_):
     return lambda s: bool(rx.search(s))
 
 
-def _addr(s, binary=""):
+_ELF_MAGIC = b"\x7fELF"
+_ELF_MIN_VADDR = {}  # path -> lowest PT_LOAD p_vaddr
+
+
+def _elf_min_vaddr(path):
+    """Lowest PT_LOAD virtual address of an ELF file (0 for shared objects).
+
+    Ghidra may relocate the image (a .so usually lands at 0x100000), so a Ghidra
+    address is not the address a file viewer / readelf / angr reports.  The
+    difference is exactly ``image_base - min(p_vaddr)``.  Parsing the program
+    headers here keeps the conversion independent of pyelftools.
+    """
+    cached = _ELF_MIN_VADDR.get(path)
+    if cached is not None:
+        return cached
+    result = 0
     try:
-        return _prog(binary).addressFactory.getAddress(s)
+        with open(path, "rb") as fh:
+            header = fh.read(64)
+            if header[:4] == _ELF_MAGIC:
+                is64 = header[4] == 2
+                endian = "little" if header[5] == 1 else "big"
+                if is64:
+                    phoff = int.from_bytes(header[32:40], endian)
+                    phentsize = int.from_bytes(header[54:56], endian)
+                    phnum = int.from_bytes(header[56:58], endian)
+                else:
+                    phoff = int.from_bytes(header[28:32], endian)
+                    phentsize = int.from_bytes(header[42:44], endian)
+                    phnum = int.from_bytes(header[44:46], endian)
+                fh.seek(phoff)
+                table = fh.read(phentsize * phnum)
+                vaddrs = []
+                for i in range(phnum):
+                    entry = table[i * phentsize:(i + 1) * phentsize]
+                    if len(entry) < phentsize:
+                        break
+                    if int.from_bytes(entry[0:4], endian) != 1:  # PT_LOAD
+                        continue
+                    offset = 16 if is64 else 8
+                    size = 8 if is64 else 4
+                    vaddrs.append(int.from_bytes(entry[offset:offset + size], endian))
+                if vaddrs:
+                    result = min(vaddrs)
+    except OSError:
+        pass
+    _ELF_MIN_VADDR[path] = result
+    return result
+
+
+def _file_address(prog, address, path=""):
+    """Ghidra address -> the address the file itself uses (ELF p_vaddr)."""
+    try:
+        value = int(address.getOffset()) if hasattr(address, "getOffset") else int(address)
+        base = int(prog.getImageBase().getOffset())
+        return value - base + (_elf_min_vaddr(path) if path else 0)
+    except Exception:
+        return int(address)
+
+
+def _addr(s, binary=""):
+    """Resolve an address. Accepts Ghidra addresses, file-relative addresses and
+    ``name@0xADDR`` selectors (the address part wins)."""
+    text = str(s or "").strip()
+    if "@" in text:
+        text = text.rsplit("@", 1)[-1]
+    prog = _prog(binary)
+    try:
+        a = prog.addressFactory.getAddress(text)
+        if a is not None and prog.memory.contains(a):
+            return a
+    except Exception:
+        pass
+    try:
+        value = int(text, 0)
+    except (TypeError, ValueError):
+        return None
+    try:  # file-relative address: shift it into Ghidra's address space
+        base = int(prog.getImageBase().getOffset())
+        return prog.addressFactory.getAddress(hex(value + base))
     except Exception:
         return None
 
@@ -110,8 +187,15 @@ def _func(target, binary=""):
     return f
 
 
-def _fn(f):
-    return {"name": f.getName(), "address": str(f.getEntryPoint()), "signature": f.getPrototypeString(False, False)}
+def _fn(f, binary=""):
+    prog = _prog(binary)
+    entry = f.getEntryPoint()
+    return {
+        "name": f.getName(),
+        "address": str(entry),
+        "file_address": f"0x{_file_address(prog, entry, _session(binary)['path']):x}",
+        "signature": f.getPrototypeString(False, False),
+    }
 
 
 def _edit(label, fn, binary=""):
@@ -378,7 +462,7 @@ def list_functions(filter: str = "", limit: int = 50, offset: int = 0, binary: s
     Available right after import; the list grows as background analysis discovers more functions."""
     m = _match(filter)
     p = _prog(binary)
-    return _json(_page((_fn(f) for f in p.functionManager.getFunctions(True) if m(f.getName())), limit, offset))
+    return _json(_page((_fn(f, binary) for f in p.functionManager.getFunctions(True) if m(f.getName())), limit, offset))
 
 
 @mcp.tool()
@@ -447,12 +531,36 @@ def list_exports(filter: str = "", limit: int = 50, offset: int = 0, binary: str
     Available right after import (no analysis needed)."""
     st = _prog(binary).symbolTable
     m = _match(filter)
+    prog = _prog(binary)
+    path = _session(binary)["path"]
     def gen():
         for a in st.getExternalEntryPointIterator():
             s = st.getPrimarySymbol(a)
             if s is not None and m(s.getName()):
-                yield {"name": s.getName(), "address": str(a)}
+                yield {"name": s.getName(), "address": str(a),
+                       "file_address": f"0x{_file_address(prog, a, path):x}"}
     return _json(_page(gen(), limit, offset))
+
+
+@mcp.tool()
+def resolve_symbol(symbol: str, binary: str = "") -> str:
+    """Resolve a function name or address to both address spaces.
+
+    Returns {"name", "address", "file_address", "signature"}. `address` is the
+    Ghidra address; `file_address` is the address the file itself uses (the ELF
+    p_vaddr, i.e. what readelf / a hex editor / angr show). Use `file_address`
+    when a selector must survive outside Ghidra. Accepts a bare name, an address,
+    or a `name@0xADDR` selector."""
+    prog = _prog(binary)
+    path = _session(binary)["path"]
+    try:
+        return _json(_fn(_func(symbol, binary), binary))
+    except ValueError:
+        a = _addr(symbol, binary)
+        if a is None:
+            raise
+        return _json({"name": None, "address": str(a),
+                      "file_address": f"0x{_file_address(prog, a, path):x}"})
 
 
 @mcp.tool()
@@ -461,7 +569,7 @@ def get_callers(function: str, limit: int = 50, offset: int = 0, binary: str = "
     busy = _require_analysis(binary)
     if busy:
         return busy
-    return _json(_page((_fn(f) for f in _func(function, binary).getCallingFunctions(_monitor())), limit, offset))
+    return _json(_page((_fn(f, binary) for f in _func(function, binary).getCallingFunctions(_monitor())), limit, offset))
 
 
 @mcp.tool()
@@ -470,7 +578,7 @@ def get_callees(function: str, limit: int = 50, offset: int = 0, binary: str = "
     busy = _require_analysis(binary)
     if busy:
         return busy
-    return _json(_page((_fn(f) for f in _func(function, binary).getCalledFunctions(_monitor())), limit, offset))
+    return _json(_page((_fn(f, binary) for f in _func(function, binary).getCalledFunctions(_monitor())), limit, offset))
 
 
 @mcp.tool()
@@ -660,7 +768,7 @@ def call_path(source: str, target: str, max_depth: int = 10, binary: str = "") -
         return _json(None)
     path, f = [], t
     while f is not None:
-        path.append(_fn(f))
+        path.append(_fn(f, binary))
         f = prev[f.getEntryPoint()]
     return _json(path[::-1])  # ponytail: one shortest path only, enumerate all if ever needed
 

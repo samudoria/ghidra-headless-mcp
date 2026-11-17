@@ -7,6 +7,7 @@ function list/memory) answer once the import is done; decompiler-driven tools re
 {"status":"analyzing"} until analysis is done. Poll load_status() for the ready signal. Every tool takes an optional
 `binary` selector (path, basename or program name); omitted = most recently loaded. See PLAN.md."""
 import hashlib, json, os, re, sys, threading, time, traceback
+import functools
 
 # JVM/Ghidra write to fd 1; keep it for MCP only and send everything else to stderr.
 _proto = os.fdopen(os.dup(1), "w")
@@ -14,8 +15,36 @@ os.dup2(2, 1)
 sys.stdout = _proto  # mcp's stdio transport reads sys.stdout at run time
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 mcp = MCPServer("ghidra-headless-mcp")
+
+# MCPServer only forwards ``ToolError`` text to the model; every other
+# exception is reported as the opaque "Error executing tool <name>". Wrap the
+# tool decorator so FileNotFoundError / ValueError / RuntimeError reach the
+# model with their real cause instead of being swallowed.
+_register_tool = mcp.tool
+
+
+def _tool(*args, **kwargs):
+    register = _register_tool(*args, **kwargs)
+
+    def decorate(fn):
+        @functools.wraps(fn)
+        def wrapper(*call_args, **call_kwargs):
+            try:
+                return fn(*call_args, **call_kwargs)
+            except ToolError:
+                raise
+            except Exception as exc:
+                raise ToolError(f"{type(exc).__name__}: {exc}") from exc
+
+        return register(wrapper)
+
+    return decorate
+
+
+mcp.tool = _tool
 SESSIONS = {}  # abspath -> {id, path, name, lock, prog, ifc, proj, state, analyzed, analyze_start, analyze_end, analyze_err, thread}
 ACTIVE = None  # abspath of the most recently loaded binary
 REGISTRY_LOCK = threading.RLock()  # guards SESSIONS/ACTIVE
@@ -149,7 +178,7 @@ def _file_address(prog, address, path=""):
 
 def _addr(s, binary=""):
     """Resolve an address. Accepts Ghidra addresses, file-relative addresses and
-    ``name@0xADDR`` selectors (the address part wins)."""
+    ``name@0xADDR`` selectors (the address part wins), or a symbol name."""
     text = str(s or "").strip()
     if "@" in text:
         text = text.rsplit("@", 1)[-1]
@@ -158,6 +187,13 @@ def _addr(s, binary=""):
         a = prog.addressFactory.getAddress(text)
         if a is not None and prog.memory.contains(a):
             return a
+    except Exception:
+        pass
+    try:  # symbol name, e.g. DAT_001ccdc0 or a function label
+        for sym in prog.symbolTable.getSymbols(text):
+            a = sym.getAddress()
+            if a is not None and prog.memory.contains(a):
+                return a
     except Exception:
         pass
     try:
@@ -372,6 +408,26 @@ def _require_analysis(binary=""):
         return _json({"status": "analyzing", "retry_after_s": _retry_after(sess), "hint": ANALYZING_HINT})
 
 
+def _resolve_binary_path(path: str) -> str:
+    """Accept an APK path with an embedded ``lib/...`` suffix.
+
+    Callers often build the native path from the APK path
+    (``app.apk/lib/arm64-v8a/x.so``) instead of the extracted directory
+    (``app/lib/arm64-v8a/x.so``). When the literal path is missing, drop the
+    ``.apk`` segment and retry.
+    """
+    p = os.path.abspath(path)
+    if os.path.isfile(p):
+        return p
+    for marker in (".apk" + os.sep, ".apk/", ".apk\\"):
+        idx = p.find(marker)
+        if idx != -1:
+            alt = p[:idx] + p[idx + 4:]
+            if os.path.isfile(alt):
+                return alt
+    return p
+
+
 def _open_or_import(path):
     from pathlib import Path
     from ghidra.base.project import GhidraProject
@@ -420,7 +476,7 @@ def load_binary(path: str, analyze: bool = True, retry: bool = False) -> str:
     that omit their `binary` selector."""
     global ACTIVE
     _home()
-    path = os.path.abspath(path)
+    path = _resolve_binary_path(path)
     if not os.path.isfile(path):
         raise FileNotFoundError(path)
     with REGISTRY_LOCK:
@@ -746,15 +802,26 @@ def read_memory(address: str, length: int = 64, binary: str = "") -> str:
     return "\n".join(f"{a.add(i)}  {data[i:i + 16].hex(' ')}" for i in range(0, length, 16))
 
 
+def _byte_pattern(pattern: str):
+    """Parse a hex byte pattern (with ``??`` wildcards) or fall back to UTF-8 text."""
+    toks = re.findall(r"\?\?|[0-9a-fA-F]{2}", pattern)
+    if not toks or re.sub(r"\?\?|[0-9a-fA-F]{2}|\s", "", pattern):
+        data = pattern.encode("utf-8")
+        if not data:
+            raise ValueError("pattern must be hex bytes or a non-empty string")
+        return data, bytes([0xFF] * len(data))
+    return (
+        bytes(0 if t == "??" else int(t, 16) for t in toks),
+        bytes(0 if t == "??" else 0xFF for t in toks),
+    )
+
+
 @mcp.tool()
 def search_bytes(pattern: str, limit: int = 50, offset: int = 0, binary: str = "") -> str:
     """Find a byte pattern in memory. Hex with '??' wildcards, e.g. '48 8b ?? 05' or 'deadbeef'.
+    A non-hex pattern is searched as a UTF-8 string (e.g. an IP or domain).
     Available right after import (raw memory scan, no analysis needed)."""
-    toks = re.findall(r"\?\?|[0-9a-fA-F]{2}", pattern)
-    if not toks or re.sub(r"\?\?|[0-9a-fA-F]{2}|\s", "", pattern):
-        raise ValueError("pattern must be hex bytes, optionally with ?? wildcards")
-    val = bytes(0 if t == "??" else int(t, 16) for t in toks)
-    mask = bytes(0 if t == "??" else 0xFF for t in toks)
+    val, mask = _byte_pattern(pattern)
     p = _prog(binary)
     def gen():
         a = p.minAddress
